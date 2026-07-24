@@ -259,8 +259,11 @@ in any file manager. The **project** folder is per day, named by date (you can
 rename it when it's created); a **new day** prompts you to start a new project
 or keep logging into the previous one — it does *not* prompt after every shot.
 Each **test** is a subfolder named by that shot's label (or `Test1`, `Test2`…
-auto-incrementing when no label is given), holding `shot.json` plus the shot's
-photos. Tap the folder path at the top of the dashboard (or the *Files* button
+auto-incrementing from the folders already present), holding `shot.json` plus
+the shot's photos. The public folders are authoritative: the app rescans them
+when it resumes and when Android reports a file change, so valid outside edits
+to `shot.json`, folder renames, and manually added images appear in the app.
+Tap the folder path at the top of the dashboard (or the *Files* button
 above the results) to open it. After setup the app prompts for **setup photos**
 of the rig; after each shot you first get a **results screen**, then the
 **after photos** prompt. Opening a past shot in the editor shows a row of photo
@@ -281,9 +284,9 @@ every result (label, date, split, distance, velocities) plus the raw
 calibration history (`.jsonl`) through Android's share sheet — email it,
 save to Drive, etc.
 
-Saving changes in a result's **Edit** dialog updates both the app's private
-result index and that test folder's canonical `shot.json`; it does not create a
-second JSON file.
+Saving changes in a result's **Edit** dialog renames that test folder when its
+label changes and updates the folder's canonical `shot.json`; it does not
+create a second JSON file.
 
 **Hardware identification & accuracy.** The device reports its hardware
 revision and timing spec (timer tick, crystal tolerance, front-end jitter)

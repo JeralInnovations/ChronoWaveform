@@ -8,6 +8,7 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.UUID
 
 /** One recorded split. Stored locally in results.json. */
 data class TestResult(
@@ -124,7 +125,62 @@ enum class DistanceUnit(val label: String, val toMeters: Double) {
     FEET("ft", 0.3048),
 }
 
-/** Dead-simple JSON file persistence — no database needed for a results log. */
+/** Parse both current public shot files and older private-cache records. */
+internal fun testResultFromJson(
+    o: JSONObject,
+    folder: String = "",
+    folderLabel: String = "",
+): TestResult {
+    val legacyOutcome = o.optString("outcome", "")
+    val sourceIsManual = o.optString("source", "") == "manual"
+    val fallbackUid = UUID.nameUUIDFromBytes(
+        (folder.ifBlank { o.toString() }).toByteArray()
+    ).toString()
+    return TestResult(
+        uid = o.optString("uid", fallbackUid).ifBlank { fallbackUid },
+        deviceResultId = o.optInt("deviceResultId", if (sourceIsManual) -1 else 0),
+        splitNs = o.optLong("splitNs", 0),
+        distanceM = o.optDouble("distanceM", 0.0).takeIf { it.isFinite() } ?: 0.0,
+        label = folderLabel.ifBlank { o.optString("label", "") },
+        epochMillis = o.optLong("epochMillis", -1L).takeIf { it > 0 },
+        tool = o.optString("tool", o.optString("disruptorTypeModel", "")),
+        shotType = o.optString("shotType", "Standard").ifBlank { "Standard" },
+        disruptorLoading = o.optString("disruptorLoading", ""),
+        projectileType = o.optString("projectileType", "Water").ifBlank { "Water" },
+        targetDistValue = o.optDouble("targetDistValue").takeIf { !it.isNaN() }
+            ?: legacyDistValue(o.optString("targetDistance", "")),
+        targetDistUnit = o.optString("targetDistUnit").ifBlank {
+            legacyDistUnit(o.optString("targetDistance", ""))
+        },
+        target = o.optString("target", ""),
+        passFail = o.optString("passFail", ""),
+        specialNotes = o.optString("specialNotes", legacyOutcome),
+        outcome = legacyOutcome,
+        manualVelocityMps = o.optDouble("manualVelocityMps").takeIf { !it.isNaN() }
+            ?: o.optDouble("velocityMps").takeIf { sourceIsManual && !it.isNaN() },
+        deviceSerial = o.optString("deviceSerial", ""),
+        resultFlags = o.optInt("resultFlags", 0),
+        rawStartTicks = o.optLong("rawStartTicks", 0),
+        rawStopTicks = o.optLong("rawStopTicks", 0),
+        batteryMv = o.optInt("batteryMv", -1).takeIf { it >= 0 },
+        portFlags = o.optInt("portFlags", 0),
+        bootId = o.optLong("bootId", 0),
+        resetCause = o.optLong("resetCause", 0),
+        hardwareRevision = o.optInt("hardwareRevision", 0),
+        firmwareVersion = o.optString("firmwareVersion", ""),
+        formatVersion = o.optInt("formatVersion", 1),
+        crcValid = o.optBoolean("crcValid", true),
+        measurementErrorM = o.optDouble(
+            "measurementErrorM",
+            o.optDouble("distanceUncertaintyM", 0.0005),
+        ).takeIf { it.isFinite() && it >= 0.0 } ?: 0.0005,
+        measurementErrorUnit = o.optString("measurementErrorUnit", "INCHES"),
+        shotFolder = folder.ifBlank { o.optString("shotFolder", "") },
+        thumbnailUri = o.optString("thumbnailUri", ""),
+    )
+}
+
+/** Private recovery cache; public project folders are the displayed source. */
 class ResultStore(context: Context, simulation: Boolean = false) {
     // Simulated runs persist to their own file so demo data never mixes with
     // real results.
@@ -135,50 +191,7 @@ class ResultStore(context: Context, simulation: Boolean = false) {
         return runCatching {
             val arr = JSONArray(file.readText())
             (0 until arr.length()).map { i ->
-                val o = arr.getJSONObject(i)
-                val legacyOutcome = o.optString("outcome", "")
-                TestResult(
-                    uid = o.getString("uid"),
-                    deviceResultId = o.getInt("deviceResultId"),
-                    splitNs = o.getLong("splitNs"),
-                    distanceM = o.getDouble("distanceM"),
-                    label = o.optString("label", ""),
-                    epochMillis = o.optLong("epochMillis", -1L).takeIf { it > 0 },
-                    tool = o.optString("tool", ""),
-                    shotType = o.optString("shotType", "Standard").ifBlank { "Standard" },
-                    disruptorLoading = o.optString("disruptorLoading", ""),
-                    projectileType = o.optString("projectileType", "Water").ifBlank { "Water" },
-                    targetDistValue = o.optDouble("targetDistValue").takeIf { !it.isNaN() }
-                        ?: legacyDistValue(o.optString("targetDistance", "")),
-                    targetDistUnit = o.optString("targetDistUnit").ifBlank {
-                        legacyDistUnit(o.optString("targetDistance", ""))
-                    },
-                    target = o.optString("target", ""),
-                    passFail = o.optString("passFail", ""),
-                    specialNotes = o.optString("specialNotes", legacyOutcome),
-                    outcome = legacyOutcome,
-                    manualVelocityMps = o.optDouble("manualVelocityMps").takeIf { !it.isNaN() },
-                    deviceSerial = o.optString("deviceSerial", ""),
-                    resultFlags = o.optInt("resultFlags", 0),
-                    rawStartTicks = o.optLong("rawStartTicks", 0),
-                    rawStopTicks = o.optLong("rawStopTicks", 0),
-                    batteryMv = o.optInt("batteryMv", -1).takeIf { it >= 0 },
-                    portFlags = o.optInt("portFlags", 0),
-                    bootId = o.optLong("bootId", 0),
-                    resetCause = o.optLong("resetCause", 0),
-                    hardwareRevision = o.optInt("hardwareRevision", 0),
-                    firmwareVersion = o.optString("firmwareVersion", ""),
-                    formatVersion = o.optInt("formatVersion", 1),
-                    crcValid = o.optBoolean("crcValid", true),
-                    measurementErrorM = o.optDouble(
-                        "measurementErrorM",
-                        o.optDouble("distanceUncertaintyM", 0.0005),
-                    )
-                        .takeIf { it.isFinite() && it >= 0.0 } ?: 0.0005,
-                    measurementErrorUnit = o.optString("measurementErrorUnit", "INCHES"),
-                    shotFolder = o.optString("shotFolder", ""),
-                    thumbnailUri = o.optString("thumbnailUri", ""),
-                )
+                testResultFromJson(arr.getJSONObject(i))
             }
         }.getOrDefault(emptyList())
     }

@@ -345,6 +345,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     r,
                     latest = r == vm.results.firstOrNull(),
                     accuracyEnvelopePercent = vm.accuracyEnvelopePercentFor(r),
+                    photoRevision = photoRevision,
                     coverFor = { vm.photosFor(r) },
                     onEdit = { editing = r },
                     onOpenPhoto = { fullscreenPhoto = it to r.uid },
@@ -493,6 +494,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     vm.resultPrompt?.let { r ->
         EditResultDialog(
             result = r,
+            photoRevision = photoRevision,
             title = "Log result",
             dismissText = "Close",
             showDelete = false,
@@ -516,6 +518,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     editing?.let { r ->
         EditResultDialog(
             result = r,
+            photoRevision = photoRevision,
             onDismiss = { editing = null },
             onSave = { label, shotType, tool, target, tdVal, tdUnit, loading, projectile, passFail, notes, epochMillis ->
                 vm.updateResult(
@@ -816,6 +819,7 @@ private fun FullLogDialog(
     onEdit: (TestResult) -> Unit,
     onOpenPhoto: (android.net.Uri, String) -> Unit,
 ) {
+    val photoRevision = vm.photoRevision
     Dialog(
         onDismissRequest = onExit,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -845,6 +849,7 @@ private fun FullLogDialog(
                             r = r,
                             latest = r == vm.results.firstOrNull(),
                             accuracyEnvelopePercent = vm.accuracyEnvelopePercentFor(r),
+                            photoRevision = photoRevision,
                             coverFor = { vm.photosFor(r) },
                             onEdit = { onEdit(r) },
                             onOpenPhoto = { onOpenPhoto(it, r.uid) },
@@ -1543,13 +1548,14 @@ private fun ResultCard(
     r: TestResult,
     latest: Boolean,
     accuracyEnvelopePercent: Double,
+    photoRevision: Int,
     coverFor: () -> List<android.net.Uri>,
     onEdit: () -> Unit,
     onOpenPhoto: (android.net.Uri) -> Unit,
 ) {
     // Resolve the cover image off the main thread: chosen thumbnail, else first photo.
     val cover by androidx.compose.runtime.produceState<android.net.Uri?>(
-        null, r.uid, r.thumbnailUri, r.shotFolder,
+        null, r.uid, r.thumbnailUri, r.shotFolder, photoRevision,
     ) {
         value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             r.thumbnailUri.takeIf { it.isNotBlank() }
@@ -1856,6 +1862,7 @@ private fun ShotTypeSelector(value: String, onChange: (String) -> Unit) {
 @Composable
 private fun EditResultDialog(
     result: TestResult,
+    photoRevision: Int,
     title: String = "Edit test",
     dismissText: String = "Cancel",
     showDelete: Boolean = true,
@@ -1874,8 +1881,10 @@ private fun EditResultDialog(
     onDelete: () -> Unit,
 ) {
     var photoRefresh by remember { mutableStateOf(0) }
-    val photos = remember(photoRefresh) { photosFor() }
-    var selectedPhoto by remember(photoRefresh) { mutableStateOf<android.net.Uri?>(null) }
+    val photos = remember(photoRefresh, photoRevision) { photosFor() }
+    var selectedPhoto by remember(photoRefresh, photoRevision) {
+        mutableStateOf<android.net.Uri?>(null)
+    }
     val pickImages = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris ->

@@ -1,6 +1,10 @@
 package com.chrono.app
 
 import android.app.Application
+import android.database.ContentObserver
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
@@ -19,8 +23,10 @@ import com.chrono.app.data.SessionManager
 import com.chrono.app.data.TestResult
 import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import com.chrono.app.ble.HwInfo
 import com.chrono.app.ble.SimFault
 import com.chrono.app.ble.HealthStatus
@@ -59,6 +65,12 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private val simSession = SessionManager(app, simulation = true)
     /** Active data sink; simulated runs are fully isolated from real ones. */
     val session: SessionManager get() = if (ble.isSimulation) simSession else realSession
+    private var projectRefreshJob: Job? = null
+    private val mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
+        override fun onChange(selfChange: Boolean) {
+            scheduleProjectRefresh(500)
+        }
+    }
 
     var screen by mutableStateOf(Screen.CONNECT)
         private set
@@ -94,11 +106,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         session.startProject(name)
         pendingLabel = session.suggestedLabel()
         projectPrompt = false
+        refreshProjectData()
     }
     fun keepProject() {
         session.continueProject()
         pendingLabel = session.suggestedLabel()
         projectPrompt = false
+        refreshProjectData()
     }
 
     fun commitPendingLabel() {
@@ -300,6 +314,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             resetReadinessThisLaunch = true
             sensor1Ready = false
             sensor2Ready = false
+            session.beginNewTest()
+            pendingLabel = session.suggestedLabel()
             ble.sendCommand(Proto.CMD_CANCEL)
             screen = Screen.BASELINE
         }
@@ -323,6 +339,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     init {
         ble.simDistanceM = distanceM
         reloadForMode()
+        runCatching {
+            app.contentResolver.registerContentObserver(
+                MediaStore.Files.getContentUri("external"),
+                true,
+                mediaObserver,
+            )
+        }
         viewModelScope.launch { ble.cal.collect { onCalReading(it) } }
         viewModelScope.launch { ble.results.collect { onRawResult(it) } }
         viewModelScope.launch {
@@ -577,6 +600,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (idx < 0) return
         results[idx] = results[idx].copy(thumbnailUri = uri)
         persist()
+        session.updateShot(results[idx].shotFolder, shotJson(results[idx]))
     }
 
     /** Copy user-picked images into a result's shot folder (edit dialog). */
@@ -588,6 +612,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (r.shotFolder.isBlank()) {
             results[idx] = r.copy(shotFolder = rel)
             persist()
+            session.updateShot(rel, shotJson(results[idx]))
         }
         for (uri in uris) session.importPhoto(rel, uri)
         autoThumbnailForFirstResultPhoto(uid)
@@ -601,6 +626,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         val uri = preferred ?: session.listPhotos(results[idx].shotFolder).firstOrNull() ?: return
         results[idx] = results[idx].copy(thumbnailUri = uri.toString())
         persist()
+        session.updateShot(results[idx].shotFolder, shotJson(results[idx]))
     }
 
     fun deleteResultPhoto(uid: String, uri: Uri) {
@@ -610,6 +636,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 results[idx] = results[idx].copy(thumbnailUri = "")
                 persist()
                 autoThumbnailForFirstResultPhoto(uid)
+                session.updateShot(results[idx].shotFolder, shotJson(results[idx]))
             }
             photoRevision++
         }
@@ -619,6 +646,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private fun shotJson(r: TestResult): JSONObject = JSONObject()
         .put("uid", r.uid)
         .put("source", if (r.isManual) "manual" else "device")
+        .put("deviceResultId", r.deviceResultId)
         .put("label", r.label)
         .put("shotType", r.shotType.ifBlank { "Standard" })
         .put("tool", r.tool)
@@ -632,6 +660,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("outcome", r.specialNotes.ifBlank { r.outcome })
         .put("splitNs", r.splitNs)
         .put("distanceM", r.distanceM)
+        .put("manualVelocityMps", r.manualVelocityMps ?: JSONObject.NULL)
         .put("measurementErrorM", r.measurementErrorM)
         .put("measurementErrorUnit", r.measurementErrorUnit)
         .put("velocityMps", r.metersPerSecond)
@@ -651,11 +680,16 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("formatVersion", r.formatVersion)
         .put("crcValid", r.crcValid)
         .put("epochMillis", r.epochMillis ?: -1L)
+        .put("shotFolder", r.shotFolder)
+        .put("thumbnailUri", r.thumbnailUri)
         .apply { r.targetDistValue?.let { put("targetDistValue", it) } }
 
     fun deleteResult(uid: String) {
-        results.removeAll { it.uid == uid }
-        persist()
+        val result = results.firstOrNull { it.uid == uid } ?: return
+        if (result.shotFolder.isBlank() || session.deleteTestFolder(result.shotFolder)) {
+            results.removeAll { it.uid == uid }
+            persist()
+        }
     }
 
     private fun persist() = store.save(results.toList())
@@ -705,8 +739,10 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (loadedMode == sim && loadedNamespace == namespace) return
         loadedMode = sim
         loadedNamespace = namespace
+        val loadedResults = session.loadProjectResults()
         results.clear()
-        results.addAll(store.load())
+        results.addAll(loadedResults)
+        store.save(loadedResults)
         calData.clear()
         for (key in listOf("b1", "b2", "l1", "l2")) {
             prefs.getString(calKey(key), null)?.split(",")?.let { p ->
@@ -717,6 +753,33 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         }
         pendingLabel = session.suggestedLabel()
         projectPrompt = session.needsProjectPrompt()
+    }
+
+    /** Re-read public shot folders after Files, USB, or another app changes them. */
+    fun refreshProjectData() {
+        scheduleProjectRefresh(0)
+    }
+
+    private fun scheduleProjectRefresh(delayMs: Long) {
+        projectRefreshJob?.cancel()
+        projectRefreshJob = viewModelScope.launch {
+            if (delayMs > 0) delay(delayMs)
+            val activeSession = session
+            val activeStore = store
+            val loadedResults = withContext(Dispatchers.IO) {
+                activeSession.loadProjectResults()
+            }
+            if (session !== activeSession) return@launch
+            results.clear()
+            results.addAll(loadedResults)
+            withContext(Dispatchers.IO) { activeStore.save(loadedResults) }
+            val generatedLabel = Regex("^Test[0-9]+$", RegexOption.IGNORE_CASE)
+                .matches(pendingLabel.trim())
+            if (pendingLabel.isBlank() || generatedLabel) {
+                pendingLabel = activeSession.suggestedLabel()
+            }
+            photoRevision++
+        }
     }
 
     // --------------------------------------------------- calibration engine
@@ -1064,6 +1127,9 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private fun setUiMode(mode: String) = prefs.edit().putString("uiMode", mode).apply()
 
     override fun onCleared() {
+        runCatching {
+            getApplication<Application>().contentResolver.unregisterContentObserver(mediaObserver)
+        }
         ble.disconnect()
     }
 }
