@@ -659,6 +659,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("specialNotes", r.specialNotes.ifBlank { r.outcome })
         .put("outcome", r.specialNotes.ifBlank { r.outcome })
         .put("splitNs", r.splitNs)
+        .put("signedSplitNs", r.signedSplitNs)
         .put("distanceM", r.distanceM)
         .put("manualVelocityMps", r.manualVelocityMps ?: JSONObject.NULL)
         .put("measurementErrorM", r.measurementErrorM)

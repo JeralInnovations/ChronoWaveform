@@ -501,7 +501,8 @@ class ChronoBle(private val context: Context) {
                 (if (split < 10_000L) Proto.RESULT_SPLIT_TOO_SHORT else 0)
             val result = RawResult(simNextId++, split, epoch, flags = flags,
                 startTicks = 1000, stopTicks = 1000 + split / 62, batteryMv = 3990,
-                bootId = 0x53494D31, hwRev = 2, fwMajor = 2, formatVersion = 2)
+                bootId = 0x53494D31, hwRev = 2, fwMajor = 2, fwMinor = 5,
+                formatVersion = 2)
             if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
             else simBufferedResults.add(result)
             simState = Proto.ST_IDLE
@@ -512,10 +513,13 @@ class ChronoBle(private val context: Context) {
     private fun emitSimFaultResult(flag: Int) {
         val epoch = if (simTimeValid) System.currentTimeMillis() / 1000L else 0L
         simPending++
-        val result = RawResult(simNextId++, 0, epoch, flags = flag,
-            startTicks = if (flag == Proto.RESULT_STOP_TIMEOUT) 1000 else 0,
+        val reversed = flag == Proto.RESULT_STOP_BEFORE_START
+        val split = if (reversed) 25_000_000L else 0L
+        val result = RawResult(simNextId++, split, epoch, flags = flag,
+            startTicks = if (reversed) 401_000 else if (flag == Proto.RESULT_STOP_TIMEOUT) 1000 else 0,
+            stopTicks = if (reversed) 1000 else 0,
             batteryMv = 3990, bootId = 0x53494D31, hwRev = 2, fwMajor = 2,
-            formatVersion = 2)
+            fwMinor = 5, formatVersion = 2)
         if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
         else simBufferedResults.add(result)
         simState = Proto.ST_FAULT

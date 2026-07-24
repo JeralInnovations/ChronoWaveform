@@ -86,10 +86,12 @@ Before every normal arm, firmware checks both ports and refuses to arm if a
 serious fault is present. A deliberately selected override is marked in the
 result flags.
 
-START capture is enabled first. A third PPI channel enables STOP capture from
-the START edge in hardware, so STOP cannot become the accepted timestamp before
-START. Firmware also records and rejects STOP-before-START, STOP timeout, and
-out-of-range split conditions.
+START and STOP first-edge captures are armed together. Each channel latches its
+own hardware timestamp and disables itself against piezo ringing. If STOP is
+captured first, firmware retains the measured magnitude, sets the
+STOP-before-START flag, and the app displays a negative split and velocity with
+an asterisk. A missing second edge still times out, and out-of-range splits
+remain flagged.
 
 The high-frequency crystal must report running before the logger enters the
 armed state. Results include raw START/STOP timer captures, fault flags, logger

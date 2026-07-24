@@ -94,7 +94,6 @@ const uint8_t GPIOTE_S1 = 0;
 const uint8_t GPIOTE_S2 = 1;
 const uint8_t PPI_S1     = 0;
 const uint8_t PPI_S2     = 1;
-const uint8_t PPI_START_ENABLES_STOP = 2;
 const uint8_t PPI_GRP_S1 = 0;
 const uint8_t PPI_GRP_S2 = 1;
 const uint32_t TIMER_HZ = 16000000UL;   // TIMER2 @ 16 MHz, PRESCALER 0
@@ -212,7 +211,7 @@ struct __attribute__((packed)) CalResult {
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
 const uint8_t FW_MAJOR = 2;
-const uint8_t FW_MINOR = 4;
+const uint8_t FW_MINOR = 5;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -348,13 +347,6 @@ void setupTiming() {
   NRF_PPI->CH[PPI_S2].TEP   = (uint32_t)&NRF_TIMER2->TASKS_CAPTURE[1];
   NRF_PPI->FORK[PPI_S2].TEP = (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS;
 
-  // START enables the STOP capture group in hardware. STOP is therefore not
-  // timestampable before START, without relying on firmware reaction time.
-  NRF_PPI->CH[PPI_START_ENABLES_STOP].EEP =
-      (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_S1];
-  NRF_PPI->CH[PPI_START_ENABLES_STOP].TEP =
-      (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_S2].EN;
-
   NRF_PPI->CHG[PPI_GRP_S1] = (1UL << PPI_S1);
   NRF_PPI->CHG[PPI_GRP_S2] = (1UL << PPI_S2);
 }
@@ -374,7 +366,7 @@ void releaseHfxo() {
   if (hfxoOn) { sd_clock_hfclk_release(); hfxoOn = false; }
 }
 
-// Prepare the capture hardware with START enabled and STOP hardware-gated.
+// Arm both first-edge captures so reversed travel keeps hardware resolution.
 bool armTiming() {
   if (!requestHfxo()) return false;
   NRF_GPIOTE->EVENTS_IN[GPIOTE_S1] = 0;
@@ -383,16 +375,14 @@ bool armTiming() {
   NRF_TIMER2->TASKS_CLEAR = 1;
   NRF_TIMER2->CC[0] = 0xFFFFFFFFUL;
   NRF_TIMER2->CC[1] = 0xFFFFFFFFUL;
-  NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS = 1;
-  NRF_PPI->CHENSET = (1UL << PPI_START_ENABLES_STOP);
   NRF_PPI->TASKS_CHG[PPI_GRP_S1].EN = 1;
+  NRF_PPI->TASKS_CHG[PPI_GRP_S2].EN = 1;
   return true;
 }
 
 void disarmTiming() {
   NRF_PPI->TASKS_CHG[PPI_GRP_S1].DIS = 1;
   NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS = 1;
-  NRF_PPI->CHENCLR = (1UL << PPI_START_ENABLES_STOP);
   releaseHfxo();
 }
 
@@ -713,6 +703,29 @@ void finishTimingFault(uint8_t faultFlag) {
   setState(ST_FAULT);
 }
 
+void finishCapturedPair() {
+  uint32_t startTicks = NRF_TIMER2->CC[0];
+  uint32_t stopTicks = NRF_TIMER2->CC[1];
+  int32_t signedTicks = (int32_t)(stopTicks - startTicks);
+  bool reversed = signedTicks < 0;
+  uint32_t ticks = reversed
+      ? (uint32_t)(-(int64_t)signedTicks)
+      : (uint32_t)signedTicks;
+  uint32_t splitNs = (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIMER_HZ);
+  uint8_t flags = activeResultFlags;
+  if (reversed) flags |= RESULT_STOP_BEFORE_START;
+  if (splitNs < MIN_SPLIT_NS) flags |= RESULT_SPLIT_TOO_SHORT;
+  if (splitNs > MAX_SPLIT_NS) flags |= RESULT_SPLIT_TOO_LONG;
+  armed = false;
+  started = false;
+  finished = false;
+  disarmTiming();
+  storeResult(splitNs, flags, startTicks, stopTicks);
+  setState((flags & (RESULT_STOP_BEFORE_START |
+                     RESULT_SPLIT_TOO_SHORT |
+                     RESULT_SPLIT_TOO_LONG)) ? ST_FAULT : ST_IDLE);
+}
+
 void beginArm(bool overrideFaults) {
   bool healthy = performHealthCheck();
   activeResultFlags = overrideFaults ? RESULT_ARM_OVERRIDE : 0;
@@ -1025,35 +1038,24 @@ void loop() {
     case ST_RUNNING:
       // Timestamps are already frozen in TIMER2->CC by hardware; here we
       // only notice that the edges happened and read the captured values.
-      if (!started && NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] &&
-          NRF_TIMER2->CC[1] == 0xFFFFFFFFUL) {
-        NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
-        finishTimingFault(RESULT_STOP_BEFORE_START);
-        break;
-      }
-      if (!started && NRF_GPIOTE->EVENTS_IN[GPIOTE_S1]) {
-        NRF_GPIOTE->EVENTS_IN[GPIOTE_S1] = 0;
-        started = true;
-        startedAtMs = millis();
-        setState(ST_RUNNING);
-      }
-      if (started && !finished && NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] &&
-          NRF_TIMER2->CC[1] != 0xFFFFFFFFUL) {
-        NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
-        finished = true;
-        uint32_t ticks = NRF_TIMER2->CC[1] - NRF_TIMER2->CC[0];  // wrap-safe
-        uint32_t splitNs = (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIMER_HZ);
-        uint8_t flags = activeResultFlags;
-        if (splitNs < MIN_SPLIT_NS) flags |= RESULT_SPLIT_TOO_SHORT;
-        if (splitNs > MAX_SPLIT_NS) flags |= RESULT_SPLIT_TOO_LONG;
-        armed = false;
-        started = false;
-        finished = false;
-        disarmTiming();
-        storeResult(splitNs, flags, NRF_TIMER2->CC[0], NRF_TIMER2->CC[1]);
-        setState((flags & (RESULT_SPLIT_TOO_SHORT | RESULT_SPLIT_TOO_LONG)) ? ST_FAULT : ST_IDLE);
-      } else if (started && (uint32_t)(millis() - startedAtMs) >= STOP_TIMEOUT_MS) {
-        finishTimingFault(RESULT_STOP_TIMEOUT);
+      {
+        bool haveStart = NRF_TIMER2->CC[0] != 0xFFFFFFFFUL;
+        bool haveStop = NRF_TIMER2->CC[1] != 0xFFFFFFFFUL;
+        if (!started && (haveStart || haveStop)) {
+          if (haveStart) NRF_GPIOTE->EVENTS_IN[GPIOTE_S1] = 0;
+          if (haveStop) NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
+          started = true;
+          startedAtMs = millis();
+          setState(ST_RUNNING);
+        }
+        if (started && !finished && haveStart && haveStop) {
+          NRF_GPIOTE->EVENTS_IN[GPIOTE_S1] = 0;
+          NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
+          finished = true;
+          finishCapturedPair();
+        } else if (started && (uint32_t)(millis() - startedAtMs) >= STOP_TIMEOUT_MS) {
+          finishTimingFault(haveStop ? RESULT_STOP_BEFORE_START : RESULT_STOP_TIMEOUT);
+        }
       }
       break;
 

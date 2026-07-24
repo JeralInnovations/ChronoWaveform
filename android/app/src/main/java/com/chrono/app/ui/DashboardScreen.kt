@@ -464,7 +464,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     for (s in vm.newShots) {
                         Row(verticalAlignment = Alignment.Bottom) {
                             Text(
-                                "%.1f".format(s.feetPerSecond),
+                                "%.1f%s".format(s.feetPerSecond, s.reversedMarker),
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 26.sp,
                                 color = Amber,
@@ -1585,7 +1585,11 @@ private fun ResultCard(
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        if (r.metersPerSecond > 0) "%.1f".format(r.feetPerSecond) else "—",
+                        if (r.metersPerSecond != 0.0) {
+                            "%.1f%s".format(r.feetPerSecond, r.reversedMarker)
+                        } else {
+                            "—"
+                        },
                         fontFamily = FontFamily.Monospace,
                         fontSize = 36.sp,
                         color = Amber,
@@ -1597,11 +1601,11 @@ private fun ResultCard(
                 val envelopeText = if (accuracyEnvelopePercent >= 0.05)
                     "+/- %.1f%% GAE".format(accuracyEnvelopePercent) else "+/- <0.1% GAE"
                 val detail = when {
-                    r.isManual && r.metersPerSecond > 0 ->
+                    r.isManual && r.metersPerSecond != 0.0 ->
                         "%.2f m/s  ·  manual entry".format(r.metersPerSecond)
                     r.isManual -> "manual entry"
-                    else -> "%.2f m/s  -  %s  -  %s".format(
-                        r.metersPerSecond, r.splitTimeText(), envelopeText
+                    else -> "%.2f%s m/s  -  %s  -  %s".format(
+                        r.metersPerSecond, r.reversedMarker, r.splitTimeText(), envelopeText
                     )
                 }
                 Text(
@@ -1931,8 +1935,11 @@ private fun EditResultDialog(
                         DistanceUnit.valueOf(result.measurementErrorUnit)
                     }.getOrDefault(DistanceUnit.INCHES)
                     val measurementError = result.measurementErrorM / errorUnit.toMeters
-                    val velocityText = if (result.metersPerSecond > 0)
-                        "%.1f ft/s".format(result.feetPerSecond) else "Not recorded"
+                    val velocityText = if (result.metersPerSecond != 0.0) {
+                        "%.1f%s ft/s".format(result.feetPerSecond, result.reversedMarker)
+                    } else {
+                        "Not recorded"
+                    }
                     ReadOnlyLogValue("Velocity", velocityText)
                     ReadOnlyLogValue("SENSOR SPACING", "%.3f in".format(spacingIn))
                     ReadOnlyLogValue(

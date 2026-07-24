@@ -343,6 +343,8 @@ screen. Either way you can walk the entire UI with no chronograph present — ha
 app before the hardware is built. A fake device drives the same screens the real
 one does. The dashboard can select stuck-high, leakage/short, unstable, coupled,
 missing-sensor, STOP-before-START, STOP-timeout, and impossible-split scenarios.
+The reversed-order simulation retains both hardware-style timestamps and shows
+negative split and velocity values with `*` to mark STOP-before-START.
 Time sync and simulated signal loss are also supported. A small **SIM** badge
 marks the session. Tap *Disconnect* to leave.
 

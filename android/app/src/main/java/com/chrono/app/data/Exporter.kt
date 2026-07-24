@@ -46,7 +46,7 @@ object Exporter {
                         r.resetCause + "," + r.resultFlags + "," + r.portFlags + "," +
                         r.rawStartTicks + "," + r.rawStopTicks + "," + r.formatVersion + "," +
                         r.crcValid + "," + esc(r.timingFaultText().orEmpty()) + "," +
-                        esc(r.splitTimeText()) + "," + r.splitNs + "," +
+                        esc(r.splitTimeText()) + "," + r.signedSplitNs + "," +
                         String.format(Locale.US, "%.6f", r.splitMillis) + "," +
                         String.format(Locale.US, "%.5f", r.distanceM) + "," +
                         String.format(Locale.US, "%.5f", r.measurementErrorM) + "," +

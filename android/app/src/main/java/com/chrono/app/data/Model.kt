@@ -9,6 +9,7 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 import java.util.UUID
+import kotlin.math.abs
 
 /** One recorded split. Stored locally in results.json. */
 data class TestResult(
@@ -56,16 +57,19 @@ data class TestResult(
     var thumbnailUri: String = "",
 ) {
     val isManual: Boolean get() = deviceResultId < 0
-    val splitSeconds: Double get() = splitNs / 1_000_000_000.0
-    val splitMillis: Double get() = splitNs / 1_000_000.0
+    val isReversed: Boolean get() = resultFlags and 0x04 != 0 && splitNs > 0
+    val signedSplitNs: Long get() = if (isReversed) -abs(splitNs) else splitNs
+    val splitSeconds: Double get() = signedSplitNs / 1_000_000_000.0
+    val splitMillis: Double get() = signedSplitNs / 1_000_000.0
     val metersPerSecond: Double
         get() = manualVelocityMps
-            ?: if (splitNs > 0 && distanceM > 0) distanceM / splitSeconds else 0.0
+            ?: if (splitNs != 0L && distanceM > 0) distanceM / splitSeconds else 0.0
     val feetPerSecond: Double get() = metersPerSecond * 3.28084
+    val reversedMarker: String get() = if (isReversed) "*" else ""
 
     fun timingFaultText(): String? = when {
         resultFlags and 0x80 != 0 -> "High-frequency clock failed to stabilize"
-        resultFlags and 0x04 != 0 -> "STOP triggered before START"
+        resultFlags and 0x04 != 0 -> "STOP triggered before START (* reversed measurement)"
         resultFlags and 0x08 != 0 -> "STOP did not trigger before timeout"
         resultFlags and 0x10 != 0 -> "Split time below allowed range"
         resultFlags and 0x20 != 0 -> "Split time above allowed range"
@@ -74,13 +78,15 @@ data class TestResult(
     }
 
     fun splitTimeText(): String {
-        if (splitNs <= 0) return "not recorded"
-        return when {
-            splitNs < 1_000L -> "${splitNs}ns"
-            splitNs < 1_000_000L -> formatWholeish(splitNs / 1_000.0, "us")
-            splitNs < 1_000_000_000L -> formatWholeish(splitNs / 1_000_000.0, "ms")
-            else -> formatWholeish(splitNs / 1_000_000_000.0, "s")
+        if (splitNs <= 0) return "not recorded${reversedMarker}"
+        val magnitude = abs(splitNs)
+        val value = when {
+            magnitude < 1_000L -> "${magnitude}ns"
+            magnitude < 1_000_000L -> formatWholeish(magnitude / 1_000.0, "us")
+            magnitude < 1_000_000_000L -> formatWholeish(magnitude / 1_000_000.0, "ms")
+            else -> formatWholeish(magnitude / 1_000_000_000.0, "s")
         }
+        return "${if (isReversed) "-" else ""}$value$reversedMarker"
     }
 
     fun targetDistanceText(): String? =
