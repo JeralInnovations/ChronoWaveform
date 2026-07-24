@@ -17,7 +17,12 @@ JeralInnovations nice!nano v2 Arduino core.
 | Battery | Protected 1S LiPo on the nice!nano battery/input rail |
 
 Use the same protected piezo input network described in the root README. The
-nice!nano profile reads its VDDH input through `analogReadVDDHDIV5()` and
+status LED gives one short heartbeat every 2 seconds while normally powered
+and blinks rapidly while the logger is armed or actively timing. The
+firmware's fault, checking, and Identify patterns take priority over the
+heartbeat.
+
+The nice!nano profile reads its VDDH input through `analogReadVDDHDIV5()` and
 smooths the value for display, warnings, and shot records. Low voltage never
 blocks arming.
 

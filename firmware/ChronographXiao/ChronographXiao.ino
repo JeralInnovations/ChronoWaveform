@@ -213,7 +213,7 @@ struct __attribute__((packed)) CalResult {
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
 const uint8_t FW_MAJOR = 2;
-const uint8_t FW_MINOR = 5;
+const uint8_t FW_MINOR = 6;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -1143,18 +1143,20 @@ void loop() {
     notifyStatus();
   }
 
-  // A held power button overrides normal state indication until accepted/released.
+  // Priority: power hold, Identify, active timing, fault, checking, heartbeat.
   if (powerButtonHolding) {
     statusLedWrite((((millis() - powerButtonPressedAtMs) / 180UL) & 1UL) == 0UL);
   } else if ((int32_t)(identifyUntilMs - millis()) > 0) {
     statusLedWrite(((millis() / 150UL) & 1UL) == 0UL);
-  } else if (state == ST_ARMED) {
-    statusLedWrite(((millis() / 1000UL) % 2UL) == 0UL);
+  } else if (state == ST_ARMED || state == ST_RUNNING) {
+    statusLedWrite(((millis() / 120UL) & 1UL) == 0UL);
   } else if (state == ST_FAULT) {
     uint32_t phase = millis() % 1200UL;
     statusLedWrite(phase < 120UL || (phase >= 240UL && phase < 360UL));
+  } else if (state == ST_CHECKING) {
+    statusLedWrite(true);
   } else {
-    statusLedWrite(state == ST_RUNNING || state == ST_CHECKING);
+    statusLedWrite((millis() % 2000UL) < 60UL);
   }
 
   delay(2);

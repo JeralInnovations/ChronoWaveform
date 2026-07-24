@@ -129,7 +129,7 @@ same piezo type, same clamp diodes, and **the same cable length** (~5 ns/m).
 | Function | Connection |
 |---|---|
 | Power button | XIAO D4 to momentary switch to GND; hold 1.5 seconds to turn the logger off or wake it from System OFF; short presses do nothing |
-| Status LED | XIAO D5 through 330 ohms to LED anode; LED cathode to GND. It flashes while a power hold is being counted, flashes three times when power-on is accepted, flashes twice slowly before power-off, stays off at idle, slow-blinks armed, stays solid while timing/checking, double-blinks a fault, and flashes rapidly for the app's Flash LED command |
+| Status LED | XIAO D5 through 330 ohms to LED anode; LED cathode to GND. It gives one short heartbeat every 2 seconds while powered, blinks rapidly while armed or timing, stays solid during a port check, double-blinks a fault, and flashes distinctly for power-button holds and the app's Flash LED command |
 | UART reserved | D6 TX and D7 RX |
 | Remappable I2C | D8/D9 |
 
@@ -158,8 +158,11 @@ to the USB connector quickly (like a mouse double-click). The onboard LED breath
 and a new port appears — that's the bootloader. Select that port and upload again.
 
 When running, the device advertises as **`Chrono-XXXX`**, where the suffix is
-derived from its permanent MCU identity. The external D5 LED indicates state
-and flashes rapidly for the app's **Flash LED** command.
+derived from its permanent MCU identity. The external D5 LED gives a short
+60 ms heartbeat every 2 seconds while normally powered and blinks rapidly
+(120 ms on, 120 ms off) while armed or actively timing. It stays solid during
+a port check, double-blinks a fault, and uses a separate fast pattern for the
+app's **Flash LED** command.
 
 The D4 power button uses a debounced 1.5-second hold in both directions. A short
 press has no effect. System OFF stops BLE and timing and leaves D4 as the

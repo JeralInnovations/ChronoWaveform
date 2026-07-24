@@ -22,7 +22,10 @@ Chrono Logger PCB. It supersedes the earlier low-capacitance TVS, BAT54S, and
 | Input stage | Direct protected GPIO, two channels |
 
 The external LED is assumed active-high: `D5 -> 330 ohm -> LED anode`, with
-the LED cathode connected to GND.
+the LED cathode connected to GND. A short pulse every 2 seconds is the powered
+heartbeat. A rapid repeating blink means the logger is armed or actively
+timing; solid means a port check is running, and a double blink indicates a
+fault.
 
 ## Final PTH Input Network
 
@@ -136,8 +139,9 @@ BLE loss but not complete logger power loss.
    short press has no effect, a 1.5-second hold powers off, and only another
    complete 1.5-second hold restores normal operation.
 2. Confirm D5 drives the external LED without using the onboard LED mapping:
-   flashing while held, three quick power-on flashes, and two slower power-off
-   flashes followed by darkness.
+   one short heartbeat every 2 seconds while idle, a rapid repeating blink
+   while armed, flashing while the power button is held, three quick power-on
+   flashes, and two slower power-off flashes followed by darkness.
 3. Scope both raw junctions and sense junctions during soft and hard strikes.
 4. Confirm the P4KE15CA and both 1N5711 orientations from the schematic/netlist.
 5. Run empty and loaded RC checks on both channels.
