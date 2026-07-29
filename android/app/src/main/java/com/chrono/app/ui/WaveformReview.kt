@@ -26,6 +26,7 @@ import androidx.compose.material.icons.filled.NavigateNext
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -87,6 +88,8 @@ fun WaveformPreview(
         .takeIf { it in 0..maxTick }
         ?: events.firstOrNull { it.channel == 1 && it.high }?.offsetTicks
         ?: maxTick
+    val selectedStart = result.reviewedStartOffsetTicks ?: automaticStart
+    val selectedStop = result.reviewedStopOffsetTicks ?: automaticStop
 
     WaveformChart(
         events = events,
@@ -94,8 +97,10 @@ fun WaveformPreview(
         viewEnd = maxTick,
         automaticStart = automaticStart,
         automaticStop = automaticStop,
-        selectedStart = result.reviewedStartOffsetTicks ?: automaticStart,
-        selectedStop = result.reviewedStopOffsetTicks ?: automaticStop,
+        selectedStart = selectedStart,
+        selectedStop = selectedStop,
+        selectedStartHigh = edgeHighAt(events, 0, selectedStart) ?: true,
+        selectedStopHigh = edgeHighAt(events, 1, selectedStop) ?: true,
         modifier = modifier.clickable(onClick = onClick),
     )
 }
@@ -127,6 +132,16 @@ fun WaveformReviewDialog(
     }
     var stopTick by remember(result.uid, result.reviewedStopOffsetTicks) {
         mutableLongStateOf(result.reviewedStopOffsetTicks ?: automaticStop)
+    }
+    var startHigh by remember(result.uid, result.reviewedStartOffsetTicks, result.traceData) {
+        mutableStateOf(
+            edgeHighAt(events, 0, result.reviewedStartOffsetTicks ?: automaticStart) ?: true
+        )
+    }
+    var stopHigh by remember(result.uid, result.reviewedStopOffsetTicks, result.traceData) {
+        mutableStateOf(
+            edgeHighAt(events, 1, result.reviewedStopOffsetTicks ?: automaticStop) ?: true
+        )
     }
     var viewStart by remember(result.uid) { mutableLongStateOf(0L) }
     var viewEnd by remember(result.uid) { mutableLongStateOf(maxTick) }
@@ -193,8 +208,8 @@ fun WaveformReviewDialog(
                     }
                 } else {
                     Text(
-                        "Tap an amber CH1 point for START and a teal CH2 point for STOP. " +
-                            "The selected points have white rings.",
+                        "Choose Rising or Falling for each cursor, then tap an amber CH1 " +
+                            "edge for START and a teal CH2 edge for STOP.",
                         modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
                         color = TextDim,
                         style = MaterialTheme.typography.bodyMedium,
@@ -207,6 +222,8 @@ fun WaveformReviewDialog(
                         automaticStop = automaticStop,
                         selectedStart = startTick,
                         selectedStop = stopTick,
+                        selectedStartHigh = startHigh,
+                        selectedStopHigh = stopHigh,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(350.dp)
@@ -218,7 +235,8 @@ fun WaveformReviewDialog(
                                     val channel = if (position.y < size.height / 2f) 0 else 1
                                     val tick = viewStart +
                                         ((position.x / size.width) * (viewEnd - viewStart)).toLong()
-                                    nearestRising(events, channel, tick)?.let {
+                                    val high = if (channel == 0) startHigh else stopHigh
+                                    nearestEdge(events, channel, tick, high)?.let {
                                         if (channel == 0) startTick = it else stopTick = it
                                     }
                                 }
@@ -230,13 +248,13 @@ fun WaveformReviewDialog(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         OutlinedButton(onClick = ::fitAll, modifier = Modifier.weight(1f)) {
-                            Text("Fit all")
+                            Text("Fit")
                         }
                         OutlinedButton(onClick = { zoom(1.8) }, modifier = Modifier.weight(1f)) {
-                            Text("Zoom in")
+                            Text("Zoom +")
                         }
                         OutlinedButton(onClick = { zoom(1 / 1.8) }, modifier = Modifier.weight(1f)) {
-                            Text("Zoom out")
+                            Text("Zoom -")
                         }
                     }
 
@@ -244,22 +262,36 @@ fun WaveformReviewDialog(
                         label = "START · CH1",
                         tick = startTick,
                         color = Amber,
+                        edgeHigh = startHigh,
+                        onEdgeHighChange = { high ->
+                            nearestEdge(events, 0, startTick, high)?.let {
+                                startHigh = high
+                                startTick = it
+                            }
+                        },
                         onPrevious = {
-                            previousRising(events, 0, startTick)?.let { startTick = it }
+                            previousEdge(events, 0, startTick, startHigh)?.let { startTick = it }
                         },
                         onNext = {
-                            nextRising(events, 0, startTick)?.let { startTick = it }
+                            nextEdge(events, 0, startTick, startHigh)?.let { startTick = it }
                         },
                     )
                     CursorControls(
                         label = "STOP · CH2",
                         tick = stopTick,
                         color = Teal,
+                        edgeHigh = stopHigh,
+                        onEdgeHighChange = { high ->
+                            nearestEdge(events, 1, stopTick, high)?.let {
+                                stopHigh = high
+                                stopTick = it
+                            }
+                        },
                         onPrevious = {
-                            previousRising(events, 1, stopTick)?.let { stopTick = it }
+                            previousEdge(events, 1, stopTick, stopHigh)?.let { stopTick = it }
                         },
                         onNext = {
-                            nextRising(events, 1, stopTick)?.let { stopTick = it }
+                            nextEdge(events, 1, stopTick, stopHigh)?.let { stopTick = it }
                         },
                     )
 
@@ -275,23 +307,31 @@ fun WaveformReviewDialog(
                 }
 
                 Spacer(Modifier.height(8.dp))
-                Row(
-                    Modifier.fillMaxWidth().padding(12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
+                Column(Modifier.fillMaxWidth().padding(12.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            modifier = Modifier.weight(1f),
+                            onClick = {
+                                startTick = automaticStart
+                                stopTick = automaticStop
+                                startHigh = true
+                                stopHigh = true
+                                onReset()
+                            },
+                        ) { Text("Automatic") }
+                        Button(
+                            modifier = Modifier.weight(1f),
+                            enabled = events.isNotEmpty(),
+                            onClick = { onApply(startTick, stopTick) },
+                        ) { Text("Apply") }
+                    }
                     TextButton(
-                        onClick = {
-                            startTick = automaticStart
-                            stopTick = automaticStop
-                            onReset()
-                        },
-                    ) { Text("Use automatic") }
-                    Spacer(Modifier.weight(1f))
-                    OutlinedButton(onClick = onDismiss) { Text("Cancel") }
-                    Button(
-                        enabled = events.isNotEmpty(),
-                        onClick = { onApply(startTick, stopTick) },
-                    ) { Text("Apply reviewed time") }
+                        onClick = onDismiss,
+                        modifier = Modifier.align(Alignment.CenterHorizontally),
+                    ) { Text("Cancel") }
                 }
             }
         }
@@ -303,30 +343,53 @@ private fun CursorControls(
     label: String,
     tick: Long,
     color: Color,
+    edgeHigh: Boolean,
+    onEdgeHighChange: (Boolean) -> Unit,
     onPrevious: () -> Unit,
     onNext: () -> Unit,
 ) {
-    Row(
-        Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
+    Card(
+        Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 5.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant,
+        ),
     ) {
-        Box(
-            Modifier.size(10.dp).background(color, RoundedCornerShape(50)),
-        )
-        Spacer(Modifier.size(8.dp))
-        Column(Modifier.weight(1f)) {
-            Text(label, style = MaterialTheme.typography.labelMedium)
-            Text(
-                formatTraceTime(ticksToNanoseconds(tick)),
-                fontFamily = FontFamily.Monospace,
-                color = color,
-            )
-        }
-        IconButton(onClick = onPrevious) {
-            Icon(Icons.Filled.NavigateBefore, "Previous rising edge")
-        }
-        IconButton(onClick = onNext) {
-            Icon(Icons.Filled.NavigateNext, "Next rising edge")
+        Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.size(10.dp).background(color, RoundedCornerShape(50)))
+                Spacer(Modifier.size(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(label, style = MaterialTheme.typography.labelMedium)
+                    Text(
+                        formatTraceTime(ticksToNanoseconds(tick)),
+                        fontFamily = FontFamily.Monospace,
+                        color = color,
+                    )
+                }
+                IconButton(onClick = onPrevious) {
+                    Icon(Icons.Filled.NavigateBefore, "Previous selected edge")
+                }
+                IconButton(onClick = onNext) {
+                    Icon(Icons.Filled.NavigateNext, "Next selected edge")
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                FilterChip(
+                    selected = edgeHigh,
+                    onClick = { onEdgeHighChange(true) },
+                    label = { Text("Rising") },
+                    modifier = Modifier.weight(1f),
+                )
+                FilterChip(
+                    selected = !edgeHigh,
+                    onClick = { onEdgeHighChange(false) },
+                    label = { Text("Falling") },
+                    modifier = Modifier.weight(1f),
+                )
+            }
         }
     }
 }
@@ -413,6 +476,8 @@ private fun WaveformChart(
     automaticStop: Long,
     selectedStart: Long,
     selectedStop: Long,
+    selectedStartHigh: Boolean,
+    selectedStopHigh: Boolean,
     modifier: Modifier,
 ) {
     val grid = MaterialTheme.colorScheme.outline.copy(alpha = 0.20f)
@@ -437,22 +502,22 @@ private fun WaveformChart(
         drawDigitalChannel(events, 0, viewStart, viewEnd, left, plotWidth, top, size.height / 2f, Amber)
         drawDigitalChannel(events, 1, viewStart, viewEnd, left, plotWidth, size.height / 2f, bottom, Teal)
 
-        fun highPointY(channel: Int): Float {
+        fun pointY(channel: Int, high: Boolean): Float {
             val bandTop = if (channel == 0) top else size.height / 2f
             val bandBottom = if (channel == 0) size.height / 2f else bottom
-            return bandTop + (bandBottom - bandTop) * 0.28f
+            return bandTop + (bandBottom - bandTop) * if (high) 0.28f else 0.72f
         }
 
-        // Every selectable rising edge gets a visible point. The chosen START
-        // and STOP points are drawn larger below so the selection is obvious.
+        // Every rising and falling edge is selectable. Vertical position shows
+        // which side of the pulse the edge enters.
         events.asSequence()
-            .filter { it.high && it.offsetTicks in viewStart..viewEnd }
+            .filter { it.offsetTicks in viewStart..viewEnd }
             .forEach { event ->
                 val color = if (event.channel == 0) Amber else Teal
                 drawCircle(
                     color = color.copy(alpha = 0.65f),
                     radius = 4.dp.toPx(),
-                    center = Offset(xFor(event.offsetTicks), highPointY(event.channel)),
+                    center = Offset(xFor(event.offsetTicks), pointY(event.channel, event.high)),
                 )
             }
 
@@ -469,12 +534,12 @@ private fun WaveformChart(
             drawLine(Teal, Offset(xFor(selectedStop), top), Offset(xFor(selectedStop), bottom), 3f)
         }
         if (selectedStart in viewStart..viewEnd) {
-            val center = Offset(xFor(selectedStart), highPointY(0))
+            val center = Offset(xFor(selectedStart), pointY(0, selectedStartHigh))
             drawCircle(Color.White, radius = 9.dp.toPx(), center = center)
             drawCircle(Amber, radius = 6.dp.toPx(), center = center)
         }
         if (selectedStop in viewStart..viewEnd) {
-            val center = Offset(xFor(selectedStop), highPointY(1))
+            val center = Offset(xFor(selectedStop), pointY(1, selectedStopHigh))
             drawCircle(Color.White, radius = 9.dp.toPx(), center = center)
             drawCircle(Teal, radius = 6.dp.toPx(), center = center)
         }
@@ -501,7 +566,8 @@ private fun WaveformChart(
             drawText(endLabel, right - paint.measureText(endLabel), size.height - 8.dp.toPx(), paint)
             if (selectedStart in viewStart..viewEnd) {
                 drawText(
-                    "A  ${formatTraceTime(ticksToNanoseconds(selectedStart))}",
+                    "A ${if (selectedStartHigh) "RISE" else "FALL"}  " +
+                        formatTraceTime(ticksToNanoseconds(selectedStart)),
                     (xFor(selectedStart) + 5.dp.toPx()).coerceAtMost(right - 110.dp.toPx()),
                     top + 14.dp.toPx(),
                     paint,
@@ -509,7 +575,8 @@ private fun WaveformChart(
             }
             if (selectedStop in viewStart..viewEnd) {
                 drawText(
-                    "B  ${formatTraceTime(ticksToNanoseconds(selectedStop))}",
+                    "B ${if (selectedStopHigh) "RISE" else "FALL"}  " +
+                        formatTraceTime(ticksToNanoseconds(selectedStop)),
                     (xFor(selectedStop) + 5.dp.toPx()).coerceAtMost(right - 110.dp.toPx()),
                     size.height / 2f + 18.dp.toPx(),
                     paint,
@@ -552,16 +619,43 @@ private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawDigitalChannel(
 private fun automaticOffset(absoluteTicks: Long, baseTicks: Long): Long =
     (absoluteTicks - baseTicks) and 0xFFFFFFFFL
 
-private fun nearestRising(events: List<WaveformEvent>, channel: Int, tick: Long): Long? =
-    events.asSequence().filter { it.channel == channel && it.high }
+private fun edgeHighAt(
+    events: List<WaveformEvent>,
+    channel: Int,
+    tick: Long,
+): Boolean? = events.firstOrNull {
+    it.channel == channel && it.offsetTicks == tick
+}?.high
+
+private fun nearestEdge(
+    events: List<WaveformEvent>,
+    channel: Int,
+    tick: Long,
+    high: Boolean,
+): Long? =
+    events.asSequence().filter { it.channel == channel && it.high == high }
         .minByOrNull { abs(it.offsetTicks - tick) }?.offsetTicks
 
-private fun previousRising(events: List<WaveformEvent>, channel: Int, tick: Long): Long? =
-    events.asSequence().filter { it.channel == channel && it.high && it.offsetTicks < tick }
+private fun previousEdge(
+    events: List<WaveformEvent>,
+    channel: Int,
+    tick: Long,
+    high: Boolean,
+): Long? =
+    events.asSequence().filter {
+        it.channel == channel && it.high == high && it.offsetTicks < tick
+    }
         .maxOfOrNull { it.offsetTicks }
 
-private fun nextRising(events: List<WaveformEvent>, channel: Int, tick: Long): Long? =
-    events.asSequence().filter { it.channel == channel && it.high && it.offsetTicks > tick }
+private fun nextEdge(
+    events: List<WaveformEvent>,
+    channel: Int,
+    tick: Long,
+    high: Boolean,
+): Long? =
+    events.asSequence().filter {
+        it.channel == channel && it.high == high && it.offsetTicks > tick
+    }
         .minOfOrNull { it.offsetTicks }
 
 private fun formatSignedTime(ns: Long): String =

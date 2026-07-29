@@ -916,6 +916,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         val events = r.waveformEvents()
         val automaticStartOffset = unsignedTickOffset(r.rawStartTicks, r.traceBaseTicks)
         val automaticStopOffset = unsignedTickOffset(r.rawStopTicks, r.traceBaseTicks)
+        fun selectedEdge(channel: Int, tick: Long?): String? = tick?.let { selectedTick ->
+            events.firstOrNull {
+                it.channel == channel && it.offsetTicks == selectedTick
+            }?.let { if (it.high) "RISING" else "FALLING" }
+        }
         return JSONObject()
             .put("resultUid", r.uid)
             .put("label", r.label)
@@ -928,6 +933,14 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             .put("automaticStopOffsetTicks", automaticStopOffset)
             .put("reviewedStartOffsetTicks", r.reviewedStartOffsetTicks ?: JSONObject.NULL)
             .put("reviewedStopOffsetTicks", r.reviewedStopOffsetTicks ?: JSONObject.NULL)
+            .put(
+                "reviewedStartEdge",
+                selectedEdge(0, r.reviewedStartOffsetTicks) ?: JSONObject.NULL,
+            )
+            .put(
+                "reviewedStopEdge",
+                selectedEdge(1, r.reviewedStopOffsetTicks) ?: JSONObject.NULL,
+            )
             .put("automaticSplitNs", r.signedSplitNs)
             .put("reviewedSplitNs", r.reviewedSplitNs ?: JSONObject.NULL)
             .put("effectiveSplitNs", r.effectiveSplitNs)
