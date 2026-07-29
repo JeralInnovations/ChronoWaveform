@@ -467,6 +467,11 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             text = {
                 Column {
                     for (s in vm.newShots) {
+                        Text(
+                            "AUTOMATIC SPEED ESTIMATE",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextDim,
+                        )
                         Row(verticalAlignment = Alignment.Bottom) {
                             Text(
                                 "%.1f".format(s.feetPerSecond),
@@ -483,17 +488,58 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                                 style = MaterialTheme.typography.bodyMedium,
                             )
                         }
+                        Text(
+                            "%.2f m/s".format(s.metersPerSecond),
+                            color = TextDim,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
                         if (s.label.isNotBlank()) {
                             Text(s.label, style = MaterialTheme.typography.bodyMedium, color = TextDim)
                         }
                         Spacer(Modifier.height(8.dp))
+                    }
+                    if (waveformShot != null) {
+                        Text(
+                            "SHOT WAVEFORM",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextDim,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        WaveformPreview(
+                            result = waveformShot,
+                            onClick = { waveformReviewUid = waveformShot.uid },
+                            modifier = Modifier.fillMaxWidth().height(190.dp),
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            "Tap the waveform to open it full screen and select the highlighted " +
+                                "CH1 START and CH2 STOP points.",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Teal,
+                            textAlign = TextAlign.Center,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else if (waitingForWaveform) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(22.dp),
+                                strokeWidth = 2.dp,
+                                color = Amber,
+                            )
+                            Spacer(Modifier.size(10.dp))
+                            Text("Receiving waveform…", color = TextDim)
+                        }
                     }
                 }
             },
             confirmButton = {
                 if (waveformShot != null) {
                     TextButton(onClick = { waveformReviewUid = waveformShot.uid }) {
-                        Text("Review waveform")
+                        Text("Select START / STOP")
                     }
                 } else {
                     TextButton(
@@ -504,7 +550,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                                 vm.dismissShotReview()
                             }
                         },
-                    ) { Text(if (waitingForWaveform) "Fetch waveform" else "Continue") }
+                    ) { Text(if (waitingForWaveform) "Retry waveform" else "Continue") }
                 }
             },
             dismissButton = {

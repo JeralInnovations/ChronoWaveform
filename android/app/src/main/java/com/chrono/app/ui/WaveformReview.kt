@@ -3,6 +3,7 @@ package com.chrono.app.ui
 import android.graphics.Paint
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.rememberTransformableState
 import androidx.compose.foundation.gestures.transformable
 import androidx.compose.foundation.layout.Arrangement
@@ -64,6 +65,40 @@ import com.chrono.app.ui.theme.Teal
 import com.chrono.app.ui.theme.TextDim
 import kotlin.math.abs
 import kotlin.math.max
+
+/**
+ * Fitted, read-only waveform used by the automatic shot-return dialog. Tapping
+ * anywhere opens the full-screen point selector.
+ */
+@Composable
+fun WaveformPreview(
+    result: TestResult,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val events = remember(result.traceData) { result.waveformEvents() }
+    if (events.isEmpty()) return
+    val maxTick = max(1L, events.maxOfOrNull { it.offsetTicks } ?: 1L)
+    val automaticStart = automaticOffset(result.rawStartTicks, result.traceBaseTicks)
+        .takeIf { it in 0..maxTick }
+        ?: events.firstOrNull { it.channel == 0 && it.high }?.offsetTicks
+        ?: 0L
+    val automaticStop = automaticOffset(result.rawStopTicks, result.traceBaseTicks)
+        .takeIf { it in 0..maxTick }
+        ?: events.firstOrNull { it.channel == 1 && it.high }?.offsetTicks
+        ?: maxTick
+
+    WaveformChart(
+        events = events,
+        viewStart = 0L,
+        viewEnd = maxTick,
+        automaticStart = automaticStart,
+        automaticStop = automaticStop,
+        selectedStart = result.reviewedStartOffsetTicks ?: automaticStart,
+        selectedStop = result.reviewedStopOffsetTicks ?: automaticStop,
+        modifier = modifier.clickable(onClick = onClick),
+    )
+}
 
 @Composable
 fun WaveformReviewDialog(
@@ -156,6 +191,13 @@ fun WaveformReviewDialog(
                         )
                     }
                 } else {
+                    Text(
+                        "Tap an amber CH1 point for START and a teal CH2 point for STOP. " +
+                            "The selected points have white rings.",
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp),
+                        color = TextDim,
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                     WaveformChart(
                         events = events,
                         viewStart = viewStart,
@@ -372,6 +414,25 @@ private fun WaveformChart(
         drawDigitalChannel(events, 0, viewStart, viewEnd, left, plotWidth, top, size.height / 2f, Amber)
         drawDigitalChannel(events, 1, viewStart, viewEnd, left, plotWidth, size.height / 2f, bottom, Teal)
 
+        fun highPointY(channel: Int): Float {
+            val bandTop = if (channel == 0) top else size.height / 2f
+            val bandBottom = if (channel == 0) size.height / 2f else bottom
+            return bandTop + (bandBottom - bandTop) * 0.28f
+        }
+
+        // Every selectable rising edge gets a visible point. The chosen START
+        // and STOP points are drawn larger below so the selection is obvious.
+        events.asSequence()
+            .filter { it.high && it.offsetTicks in viewStart..viewEnd }
+            .forEach { event ->
+                val color = if (event.channel == 0) Amber else Teal
+                drawCircle(
+                    color = color.copy(alpha = 0.65f),
+                    radius = 4.dp.toPx(),
+                    center = Offset(xFor(event.offsetTicks), highPointY(event.channel)),
+                )
+            }
+
         if (automaticStart in viewStart..viewEnd) {
             drawLine(Amber.copy(alpha = 0.35f), Offset(xFor(automaticStart), top), Offset(xFor(automaticStart), bottom), 2f)
         }
@@ -383,6 +444,16 @@ private fun WaveformChart(
         }
         if (selectedStop in viewStart..viewEnd) {
             drawLine(Teal, Offset(xFor(selectedStop), top), Offset(xFor(selectedStop), bottom), 3f)
+        }
+        if (selectedStart in viewStart..viewEnd) {
+            val center = Offset(xFor(selectedStart), highPointY(0))
+            drawCircle(Color.White, radius = 9.dp.toPx(), center = center)
+            drawCircle(Amber, radius = 6.dp.toPx(), center = center)
+        }
+        if (selectedStop in viewStart..viewEnd) {
+            val center = Offset(xFor(selectedStop), highPointY(1))
+            drawCircle(Color.White, radius = 9.dp.toPx(), center = center)
+            drawCircle(Teal, radius = 6.dp.toPx(), center = center)
         }
 
         val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {

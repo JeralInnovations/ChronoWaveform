@@ -1,5 +1,6 @@
 # Development Log
 
+- 2026-07-29: Added an automatic waveform-first shot-return popup with speed estimate, a tappable fitted preview, and clearly highlighted selectable START/STOP edge points in full-screen review.
 - 2026-07-29: Fixed camera-return setup recovery, retained pending camera URIs, bound after photos to the recorded result folder, added persistent BLE result deduplication, and exposed waveform retry/review actions.
 - 2026-07-29: Created the existing-hardware Waveform Review edition with high/low edge traces, CRC-checked BLE chunks, reconnect-safe ACK handling, scaled two-channel rendering, selectable cursors, reviewed timing, simulation, and waveform exports.
 - 2026-07-07: Added simulation training parity for buffered reconnect results and MCU serial tracking in firmware, app logs, and exports.
