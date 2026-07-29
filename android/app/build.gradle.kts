@@ -12,8 +12,8 @@ android {
         applicationId = "com.chrono.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "2.1.1-waveform"
+        versionCode = 6
+        versionName = "2.1.2-waveform"
     }
 
     buildTypes {

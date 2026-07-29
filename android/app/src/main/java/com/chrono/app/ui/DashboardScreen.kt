@@ -144,7 +144,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     val running = state == Proto.ST_RUNNING
     val health by vm.ble.health.collectAsState()
     var editing by remember { mutableStateOf<TestResult?>(null) }
-    var waveformReviewUid by remember { mutableStateOf<String?>(null) }
+    var waveformReviewResult by remember { mutableStateOf<TestResult?>(null) }
     var manualEntry by remember { mutableStateOf(false) }
     // (photo uri, owning result uid) so the viewer can offer "set as cover"
     var fullscreenPhoto by remember { mutableStateOf<Pair<android.net.Uri, String>?>(null) }
@@ -349,7 +349,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     coverFor = { vm.photosFor(r) },
                     onEdit = { editing = r },
                     onOpenPhoto = { fullscreenPhoto = it to r.uid },
-                    onReviewWaveform = { waveformReviewUid = r.uid },
+                    onReviewWaveform = { waveformReviewResult = r },
                     onFetchWaveform = { vm.requestWaveform(r.uid) },
                     waveformStatus = vm.waveformStatusFor(r.uid),
                 )
@@ -456,7 +456,11 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     }
 
     // Shots received (e.g. after walking back into range): review, then photos.
-    if (vm.newShots.isNotEmpty() && vm.retestSensor == null) {
+    if (
+        vm.newShots.isNotEmpty() &&
+        vm.retestSensor == null &&
+        waveformReviewResult == null
+    ) {
         val waveformShot = vm.newShots.firstOrNull { it.hasWaveform }
         val waitingWaveformShot = vm.newShots.firstOrNull {
             it.firmwareVersion.startsWith("3.") && !it.hasWaveform
@@ -523,7 +527,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                         Spacer(Modifier.height(6.dp))
                         WaveformPreview(
                             result = waveformShot,
-                            onClick = { waveformReviewUid = waveformShot.uid },
+                            onClick = { waveformReviewResult = waveformShot },
                             modifier = Modifier.fillMaxWidth().height(190.dp),
                         )
                         Spacer(Modifier.height(6.dp))
@@ -554,7 +558,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             },
             confirmButton = {
                 if (waveformShot != null) {
-                    TextButton(onClick = { waveformReviewUid = waveformShot.uid }) {
+                    TextButton(onClick = { waveformReviewResult = waveformShot }) {
                         Text("Select START / STOP")
                     }
                 } else {
@@ -637,7 +641,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             onOpenPhoto = { uri, uid -> fullscreenPhoto = uri to uid },
             onReviewWaveform = { result ->
                 vm.hideFullLog()
-                waveformReviewUid = result.uid
+                waveformReviewResult = result
             },
             onFetchWaveform = { result -> vm.requestWaveform(result.uid) },
         )
@@ -682,22 +686,28 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
         }
     }
 
-    waveformReviewUid?.let { uid ->
-        vm.results.firstOrNull { it.uid == uid }?.let { result ->
-            WaveformReviewDialog(
-                result = result,
-                accuracyEnvelopePercentForSplit = { splitNs ->
-                    vm.accuracyEnvelopePercentForSelection(result, splitNs)
-                },
-                onDismiss = { waveformReviewUid = null },
-                onApply = { start, stop ->
-                    vm.applyReviewedTiming(uid, start, stop)
-                    waveformReviewUid = null
-                    if (vm.newShots.any { it.uid == uid }) vm.dismissShotReview()
-                },
-                onReset = { vm.resetReviewedTiming(uid) },
-            )
-        } ?: run { waveformReviewUid = null }
+    waveformReviewResult?.let { selected ->
+        // A MediaStore refresh can briefly leave an older copy of this record
+        // in the saved log while the shot popup already has the received trace.
+        // Always open whichever copy actually contains waveform transitions.
+        val result = listOfNotNull(
+            vm.newShots.firstOrNull { it.uid == selected.uid },
+            vm.results.firstOrNull { it.uid == selected.uid },
+            selected,
+        ).firstOrNull { it.hasWaveform } ?: selected
+        WaveformReviewDialog(
+            result = result,
+            accuracyEnvelopePercentForSplit = { splitNs ->
+                vm.accuracyEnvelopePercentForSelection(result, splitNs)
+            },
+            onDismiss = { waveformReviewResult = null },
+            onApply = { start, stop ->
+                vm.applyReviewedTiming(result.uid, start, stop)
+                waveformReviewResult = null
+                if (vm.newShots.any { it.uid == result.uid }) vm.dismissShotReview()
+            },
+            onReset = { vm.resetReviewedTiming(result.uid) },
+        )
     }
 
     if (manualEntry) {

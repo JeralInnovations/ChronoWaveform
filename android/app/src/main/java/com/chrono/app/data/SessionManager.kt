@@ -194,6 +194,12 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         return writeShotJson(rel, json)
     }
 
+    /** Store the readable edge trace beside shot.json in the same test folder. */
+    fun updateWaveform(rel: String, json: JSONObject): Boolean {
+        if (rel.isBlank()) return false
+        return writeJsonFile(rel, "waveform.json", json)
+    }
+
     /** Folder to attach photos to an existing record without touching counters. */
     fun folderForResult(existingRel: String?, uidHint: String): String {
         if (!existingRel.isNullOrBlank()) return existingRel
@@ -256,10 +262,13 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
      * for labels, while every other field comes from that folder's shot.json.
      */
     fun loadProjectResults(): List<TestResult> {
-        val allFiles = projectFiles()
+        // The app log is a history, not just the currently active project.
+        // Scan every public project so reinstalling the app or starting a new
+        // project never makes earlier recorded tests disappear.
+        val allFiles = projectFiles(allProjects = true)
         val jsonFiles = allFiles
             .filter { it.displayName.equals("shot.json", ignoreCase = true) }
-            .groupBy { it.folderName.lowercase(Locale.US) }
+            .groupBy { it.relativeFolder.lowercase(Locale.US) }
             .values
             .mapNotNull { files -> files.maxByOrNull { it.modifiedAt } }
 
@@ -268,7 +277,10 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         val parsed = jsonFiles.mapNotNull { stored ->
             runCatching {
                 val json = JSONObject(readStoredText(stored))
-                if (activeBeforeScan != null && stored.relativeFolder != activeBeforeScan) {
+                if (activeBeforeScan != null &&
+                    stored.relativeFolder.substringBefore('/') == projectName &&
+                    stored.relativeFolder != activeBeforeScan
+                ) {
                     val oldLabel = activeBeforeScan.substringAfterLast('/')
                     if (json.optString("shotFolder") == activeBeforeScan ||
                         json.optString("label") == oldLabel
@@ -301,7 +313,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
     /** Delete the public folder represented by a result removed in the app. */
     fun deleteTestFolder(rel: String): Boolean {
         if (rel.isBlank()) return false
-        val matching = projectFiles().filter { it.relativeFolder == rel }
+        val matching = projectFiles(allProjects = true).filter { it.relativeFolder == rel }
         var success = true
         for (stored in matching) {
             val deleted = if (stored.uri != null) {
@@ -333,27 +345,36 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         val file: File? = null,
     )
 
-    private fun projectFiles(): List<StoredProjectFile> {
-        val project = projectName ?: return emptyList()
+    private fun projectFiles(allProjects: Boolean = false): List<StoredProjectFile> {
+        val project = projectName
+        if (!allProjects && project == null) return emptyList()
         if (!useMediaStore) {
             val root = context.getExternalFilesDir(null) ?: context.filesDir
-            val projectDir = File(root, "$rootDir/$project")
-            return projectDir.listFiles { file -> file.isDirectory }
-                ?.flatMap { folder ->
-                    folder.listFiles()?.filter { it.isFile }?.map { file ->
+            val dataDir = File(root, rootDir)
+            val projectDirs = if (allProjects) {
+                dataDir.listFiles { file -> file.isDirectory }?.toList().orEmpty()
+            } else {
+                listOf(File(dataDir, project!!))
+            }
+            return projectDirs.flatMap { projectDir ->
+                projectDir.listFiles { file -> file.isDirectory }
+                    ?.flatMap { folder ->
+                        folder.listFiles()?.filter { it.isFile }?.map { file ->
                         StoredProjectFile(
                             folderName = folder.name,
-                            relativeFolder = "$project/${folder.name}",
+                            relativeFolder = "${projectDir.name}/${folder.name}",
                             displayName = file.name,
                             modifiedAt = file.lastModified() / 1000L,
                             file = file,
                         )
+                        } ?: emptyList()
                     } ?: emptyList()
-                } ?: emptyList()
+            }
         }
 
         val collection = MediaStore.Files.getContentUri("external")
-        val prefix = "Documents/$rootDir/$project/"
+        val rootPrefix = "Documents/$rootDir/"
+        val queryPrefix = if (allProjects) rootPrefix else "$rootPrefix$project/"
         val out = mutableListOf<StoredProjectFile>()
         runCatching {
             context.contentResolver.query(
@@ -365,7 +386,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
                     MediaStore.MediaColumns.DATE_MODIFIED,
                 ),
                 "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
-                arrayOf("$prefix%"),
+                arrayOf("$queryPrefix%"),
                 null,
             )?.use { cursor ->
                 val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
@@ -377,14 +398,17 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
                     cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_MODIFIED)
                 while (cursor.moveToNext()) {
                     val path = cursor.getString(pathColumn) ?: continue
-                    if (!path.startsWith(prefix)) continue
-                    val tail = path.removePrefix(prefix).trim('/')
-                    val folderName = tail.substringBefore('/').takeIf { it.isNotBlank() } ?: continue
+                    if (!path.startsWith(rootPrefix)) continue
+                    val parts = path.removePrefix(rootPrefix).trim('/').split('/')
+                    if (parts.size < 2) continue
+                    val storedProject = parts[0].takeIf { it.isNotBlank() } ?: continue
+                    if (!allProjects && storedProject != project) continue
+                    val folderName = parts[1].takeIf { it.isNotBlank() } ?: continue
                     val id = cursor.getLong(idColumn)
                     out.add(
                         StoredProjectFile(
                             folderName = folderName,
-                            relativeFolder = "$project/$folderName",
+                            relativeFolder = "$storedProject/$folderName",
                             displayName = cursor.getString(nameColumn).orEmpty(),
                             modifiedAt = cursor.getLong(modifiedColumn),
                             uri = ContentUris.withAppendedId(collection, id),
@@ -421,17 +445,21 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
     // ------------------------------------------------------------------ helpers
 
     private fun writeShotJson(rel: String, json: JSONObject): Boolean {
+        return writeJsonFile(rel, "shot.json", json)
+    }
+
+    private fun writeJsonFile(rel: String, name: String, json: JSONObject): Boolean {
         val bytes = json.toString(2).toByteArray()
         if (!useMediaStore) {
             val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "$rootDir/$rel")
             return runCatching {
                 dir.mkdirs()
-                File(dir, "shot.json").writeBytes(bytes)
+                File(dir, name).writeBytes(bytes)
             }.isSuccess
         }
 
-        val uri = findUriAt(rel, "shot.json")
-            ?: createUriAt(rel, "shot.json", "application/json")
+        val uri = findUriAt(rel, name)
+            ?: createUriAt(rel, name, "application/json")
             ?: return false
         return runCatching {
             context.contentResolver.openOutputStream(uri, "wt")!!.use { it.write(bytes) }

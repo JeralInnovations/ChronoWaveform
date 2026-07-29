@@ -1,5 +1,6 @@
 # Development Log
 
+- 2026-07-29: Made waveform preview/button taps open a dedicated full-screen review state, persisted every received/reviewed trace to both shot.json and adjacent waveform.json, and restored the app log from all public project folders.
 - 2026-07-29: Fixed missing waveform graphs by enabling the logger's large-MTU BLE mode before radio startup, retrying complete trace transfers, rejecting empty traces, showing transfer errors, and embedding a tappable graph directly in each result card.
 - 2026-07-29: Added an automatic waveform-first shot-return popup with speed estimate, a tappable fitted preview, and clearly highlighted selectable START/STOP edge points in full-screen review.
 - 2026-07-29: Fixed camera-return setup recovery, retained pending camera URIs, bound after photos to the recorded result folder, added persistent BLE result deduplication, and exposed waveform retry/review actions.

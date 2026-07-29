@@ -681,13 +681,15 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         waveformRetryJobs.remove(uid)?.cancel()
         waveformTransferStatus.remove(uid)
         persist()
+        persistPublicResult(updated)
         ble.sendCommand(Proto.CMD_ACK, trace.resultId)
     }
 
     fun applyReviewedTiming(uid: String, startOffsetTicks: Long, stopOffsetTicks: Long) {
         val index = results.indexOfFirst { it.uid == uid }
         if (index < 0) return
-        val result = results[index]
+        val result = newShots.firstOrNull { it.uid == uid && it.hasWaveform }
+            ?: results[index]
         val reviewedNs = ticksToNanoseconds(stopOffsetTicks - startOffsetTicks)
         val updated = result.copy(
             reviewedSplitNs = reviewedNs,
@@ -699,12 +701,15 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         val newIndex = newShots.indexOfFirst { it.uid == uid }
         if (newIndex >= 0) newShots[newIndex] = updated
         persist()
+        persistPublicResult(updated)
     }
 
     fun resetReviewedTiming(uid: String) {
         val index = results.indexOfFirst { it.uid == uid }
         if (index < 0) return
-        val updated = results[index].copy(
+        val result = newShots.firstOrNull { it.uid == uid && it.hasWaveform }
+            ?: results[index]
+        val updated = result.copy(
             reviewedSplitNs = null,
             reviewedStartOffsetTicks = null,
             reviewedStopOffsetTicks = null,
@@ -714,6 +719,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         val newIndex = newShots.indexOfFirst { it.uid == uid }
         if (newIndex >= 0) newShots[newIndex] = updated
         persist()
+        persistPublicResult(updated)
     }
 
     fun updateResult(
@@ -752,7 +758,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         )
         results[idx] = updated
         persist()
-        session.updateShot(rel, shotJson(results[idx]))
+        persistPublicResult(results[idx])
     }
 
     /** Log a shot with no chronograph connected — velocity typed in (or blank). */
@@ -906,6 +912,47 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("thumbnailUri", r.thumbnailUri)
         .apply { r.targetDistValue?.let { put("targetDistValue", it) } }
 
+    private fun waveformJson(r: TestResult): JSONObject {
+        val events = r.waveformEvents()
+        val automaticStartOffset = unsignedTickOffset(r.rawStartTicks, r.traceBaseTicks)
+        val automaticStopOffset = unsignedTickOffset(r.rawStopTicks, r.traceBaseTicks)
+        return JSONObject()
+            .put("resultUid", r.uid)
+            .put("label", r.label)
+            .put("shotFolder", r.shotFolder)
+            .put("timerHz", 16_000_000)
+            .put("traceFormatVersion", r.traceFormatVersion)
+            .put("traceBaseTicks", r.traceBaseTicks)
+            .put("traceFlags", r.traceFlags)
+            .put("automaticStartOffsetTicks", automaticStartOffset)
+            .put("automaticStopOffsetTicks", automaticStopOffset)
+            .put("reviewedStartOffsetTicks", r.reviewedStartOffsetTicks ?: JSONObject.NULL)
+            .put("reviewedStopOffsetTicks", r.reviewedStopOffsetTicks ?: JSONObject.NULL)
+            .put("automaticSplitNs", r.signedSplitNs)
+            .put("reviewedSplitNs", r.reviewedSplitNs ?: JSONObject.NULL)
+            .put("effectiveSplitNs", r.effectiveSplitNs)
+            .put("events", org.json.JSONArray().apply {
+                events.forEach { event ->
+                    put(
+                        JSONObject()
+                            .put("offsetTicks", event.offsetTicks)
+                            .put("timeNs", ticksToNanoseconds(event.offsetTicks))
+                            .put("channel", event.channel + 1)
+                            .put("level", if (event.high) "HIGH" else "LOW")
+                    )
+                }
+            })
+    }
+
+    private fun unsignedTickOffset(ticks: Long, baseTicks: Long): Long =
+        (ticks - baseTicks) and 0xFFFFFFFFL
+
+    private fun persistPublicResult(r: TestResult) {
+        if (r.shotFolder.isBlank()) return
+        session.updateShot(r.shotFolder, shotJson(r))
+        if (r.hasWaveform) session.updateWaveform(r.shotFolder, waveformJson(r))
+    }
+
     fun deleteResult(uid: String) {
         val result = results.firstOrNull { it.uid == uid } ?: return
         if (result.shotFolder.isBlank() || session.deleteTestFolder(result.shotFolder)) {
@@ -961,7 +1008,9 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (loadedMode == sim && loadedNamespace == namespace) return
         loadedMode = sim
         loadedNamespace = namespace
-        val loadedResults = session.loadProjectResults()
+        val publicResults = session.loadProjectResults()
+        val cachedResults = store.load()
+        val loadedResults = mergeLoadedResults(publicResults, cachedResults)
         results.clear()
         results.addAll(loadedResults)
         store.save(loadedResults)
@@ -977,6 +1026,36 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         projectPrompt = session.needsProjectPrompt()
     }
 
+    /**
+     * Public folders are authoritative, but a MediaStore scan must never
+     * downgrade a just-received trace to an older shot.json copy. The private
+     * cache is also a fallback when an app reinstall lost the active-project
+     * preference before public folder discovery completed.
+     */
+    private fun mergeLoadedResults(
+        publicResults: List<TestResult>,
+        fallbackResults: List<TestResult>,
+    ): List<TestResult> {
+        if (publicResults.isEmpty()) return fallbackResults
+        return publicResults.map { public ->
+            val fallback = fallbackResults.firstOrNull {
+                it.uid == public.uid ||
+                    (it.shotFolder.isNotBlank() && it.shotFolder == public.shotFolder)
+            } ?: return@map public
+            if (public.hasWaveform || !fallback.hasWaveform) return@map public
+            public.copy(
+                traceFormatVersion = fallback.traceFormatVersion,
+                traceBaseTicks = fallback.traceBaseTicks,
+                traceFlags = fallback.traceFlags,
+                traceData = fallback.traceData,
+                reviewedSplitNs = fallback.reviewedSplitNs,
+                reviewedStartOffsetTicks = fallback.reviewedStartOffsetTicks,
+                reviewedStopOffsetTicks = fallback.reviewedStopOffsetTicks,
+                reviewedAtMillis = fallback.reviewedAtMillis,
+            )
+        }
+    }
+
     /** Re-read public shot folders after Files, USB, or another app changes them. */
     fun refreshProjectData() {
         scheduleProjectRefresh(0)
@@ -988,10 +1067,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             if (delayMs > 0) delay(delayMs)
             val activeSession = session
             val activeStore = store
-            val loadedResults = withContext(Dispatchers.IO) {
+            val inMemoryResults = (results.toList() + newShots.toList())
+                .distinctBy { it.uid }
+            val publicResults = withContext(Dispatchers.IO) {
                 activeSession.loadProjectResults()
             }
             if (session !== activeSession) return@launch
+            val loadedResults = mergeLoadedResults(publicResults, inMemoryResults)
             results.clear()
             results.addAll(loadedResults)
             withContext(Dispatchers.IO) { activeStore.save(loadedResults) }
