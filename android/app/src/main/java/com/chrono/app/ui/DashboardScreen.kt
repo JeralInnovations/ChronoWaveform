@@ -158,10 +158,9 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
         batteryMv != dismissedLowBatteryMv
 
     // System camera writing straight into the shot folder: no CAMERA permission.
-    var pendingPhoto by remember { mutableStateOf<android.net.Uri?>(null) }
     val takePicture = rememberLauncherForActivityResult(
         ActivityResultContracts.TakePicture()
-    ) { ok -> pendingPhoto?.let { vm.photoSaved(ok, it) }; pendingPhoto = null }
+    ) { ok -> vm.completePhotoCapture(ok) }
     val pickPromptPhotos = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris -> vm.importPromptPhotos(uris) }
@@ -349,6 +348,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     onEdit = { editing = r },
                     onOpenPhoto = { fullscreenPhoto = it to r.uid },
                     onReviewWaveform = { waveformReviewUid = r.uid },
+                    onFetchWaveform = { vm.requestWaveform(r.uid) },
                 )
             }
         }
@@ -455,9 +455,10 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     // Shots received (e.g. after walking back into range): review, then photos.
     if (vm.newShots.isNotEmpty() && vm.retestSensor == null) {
         val waveformShot = vm.newShots.firstOrNull { it.hasWaveform }
-        val waitingForWaveform = vm.newShots.any {
+        val waitingWaveformShot = vm.newShots.firstOrNull {
             it.firmwareVersion.startsWith("3.") && !it.hasWaveform
         }
+        val waitingForWaveform = waitingWaveformShot != null
         AlertDialog(
             onDismissRequest = { vm.dismissShotReview() },
             title = {
@@ -496,9 +497,14 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     }
                 } else {
                     TextButton(
-                        onClick = { vm.dismissShotReview() },
-                        enabled = !waitingForWaveform,
-                    ) { Text(if (waitingForWaveform) "Receiving waveform…" else "Continue") }
+                        onClick = {
+                            if (waitingWaveformShot != null) {
+                                vm.requestWaveform(waitingWaveformShot.uid)
+                            } else {
+                                vm.dismissShotReview()
+                            }
+                        },
+                    ) { Text(if (waitingForWaveform) "Fetch waveform" else "Continue") }
                 }
             },
             dismissButton = {
@@ -565,6 +571,11 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 editing = it
             },
             onOpenPhoto = { uri, uid -> fullscreenPhoto = uri to uid },
+            onReviewWaveform = { result ->
+                vm.hideFullLog()
+                waveformReviewUid = result.uid
+            },
+            onFetchWaveform = { result -> vm.requestWaveform(result.uid) },
         )
     }
 
@@ -712,9 +723,10 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                         Text("Upload")
                     }
                     TextButton(onClick = {
-                        vm.newPhotoUri()?.let { uri ->
-                            pendingPhoto = uri
-                            runCatching { takePicture.launch(uri) }
+                        vm.beginPhotoCapture()?.let { uri ->
+                            if (runCatching { takePicture.launch(uri) }.isFailure) {
+                                vm.completePhotoCapture(false)
+                            }
                         }
                     }) {
                         Icon(Icons.Filled.PhotoCamera, null, modifier = Modifier.size(16.dp))
@@ -839,6 +851,8 @@ private fun FullLogDialog(
     onExit: () -> Unit,
     onEdit: (TestResult) -> Unit,
     onOpenPhoto: (android.net.Uri, String) -> Unit,
+    onReviewWaveform: (TestResult) -> Unit,
+    onFetchWaveform: (TestResult) -> Unit,
 ) {
     Dialog(
         onDismissRequest = onExit,
@@ -872,6 +886,8 @@ private fun FullLogDialog(
                             coverFor = { vm.photosFor(r) },
                             onEdit = { onEdit(r) },
                             onOpenPhoto = { onOpenPhoto(it, r.uid) },
+                            onReviewWaveform = { onReviewWaveform(r) },
+                            onFetchWaveform = { onFetchWaveform(r) },
                         )
                         val photos = vm.photosFor(r)
                         if (photos.isNotEmpty()) {
@@ -1562,6 +1578,7 @@ private fun ResultCard(
     onEdit: () -> Unit,
     onOpenPhoto: (android.net.Uri) -> Unit,
     onReviewWaveform: (() -> Unit)? = null,
+    onFetchWaveform: (() -> Unit)? = null,
 ) {
     // Resolve the cover image off the main thread: chosen thumbnail, else first photo.
     val cover by androidx.compose.runtime.produceState<android.net.Uri?>(
@@ -1625,6 +1642,17 @@ private fun ResultCard(
                         Icon(Icons.Filled.AccessTime, null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.size(6.dp))
                         Text(if (r.isWaveformReviewed) "Reviewed waveform" else "Review waveform")
+                    }
+                } else if (
+                    !r.isManual &&
+                    r.firmwareVersion.startsWith("3.") &&
+                    onFetchWaveform != null
+                ) {
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = onFetchWaveform) {
+                        Icon(Icons.Filled.AccessTime, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.size(6.dp))
+                        Text("Fetch waveform")
                     }
                 }
                 r.timingFaultText()?.let { fault ->

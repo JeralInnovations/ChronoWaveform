@@ -106,6 +106,14 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var photoRevision by mutableStateOf(0)
         private set
+    var pendingCameraUri by mutableStateOf(
+        prefs.getString("pendingCameraUri", null)?.let(Uri::parse)
+    )
+        private set
+    var photoPromptResultUid by mutableStateOf(
+        prefs.getString("photoPromptResultUid", null)
+    )
+        private set
     var setupPhotosNeeded by mutableStateOf(prefs.getBoolean("setupPhotosNeeded", false))
         private set
     var resultPromptUid by mutableStateOf<String?>(null)
@@ -117,16 +125,31 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     // photoPrompt is persisted so a camera-triggered process restart resumes
     // the photo step instead of losing it.
-    private fun showPhotoPrompt(kind: String) {
+    private fun showPhotoPrompt(kind: String, resultUid: String? = null) {
         photoPrompt = kind; photoCount = 0
-        prefs.edit().putString("photoPrompt", kind).apply()
+        photoPromptResultUid = resultUid
+        prefs.edit()
+            .putString("photoPrompt", kind)
+            .apply {
+                if (resultUid == null) remove("photoPromptResultUid")
+                else putString("photoPromptResultUid", resultUid)
+            }
+            .apply()
     }
     fun dismissPhotoPrompt() {
         val kind = photoPrompt
         if (kind == "setup") updateSetupPhotosNeeded(promptPhotoCount(kind) == 0)
-        if (kind == "after") resultPromptUid = results.firstOrNull()?.uid
+        if (kind == "after") {
+            resultPromptUid = photoPromptResultUid ?: results.firstOrNull()?.uid
+        }
         photoPrompt = null
-        prefs.edit().remove("photoPrompt").apply()
+        photoPromptResultUid = null
+        pendingCameraUri = null
+        prefs.edit()
+            .remove("photoPrompt")
+            .remove("photoPromptResultUid")
+            .remove("pendingCameraUri")
+            .apply()
     }
 
     private fun updateSetupPhotosNeeded(needed: Boolean) {
@@ -145,14 +168,37 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         showFullLog = false
     }
 
-    /** Create the next photo target inside the right test folder. */
-    fun newPhotoUri(): Uri? {
+    /**
+     * Create and remember the camera target before launching the external
+     * camera. Android may destroy this activity while that camera is open, so
+     * keeping the URI only in Compose state loses the returning result.
+     */
+    fun beginPhotoCapture(): Uri? {
         val kind = photoPrompt ?: return null
-        return session.newPhotoUri(kind, pendingLabel.trim())
+        val ownerFolder = photoPromptResultUid
+            ?.let { uid -> results.firstOrNull { it.uid == uid }?.shotFolder }
+            ?.takeIf { it.isNotBlank() }
+        val target = if (kind == "after" && ownerFolder != null) {
+            session.newPhotoUriInFolder(ownerFolder, kind)
+        } else {
+            session.newPhotoUri(kind, pendingLabel.trim())
+        }
+        return target?.also { uri ->
+            pendingCameraUri = uri
+            prefs.edit().putString("pendingCameraUri", uri.toString()).apply()
+        }
     }
 
-    fun promptPhotos(kind: String): List<Uri> =
-        session.listPromptPhotos(kind, pendingLabel.trim())
+    fun promptPhotos(kind: String): List<Uri> {
+        val ownerFolder = photoPromptResultUid
+            ?.let { uid -> results.firstOrNull { it.uid == uid }?.shotFolder }
+            ?.takeIf { it.isNotBlank() }
+        return if (kind == "after" && ownerFolder != null) {
+            session.listPhotos(ownerFolder)
+        } else {
+            session.listPromptPhotos(kind, pendingLabel.trim())
+        }
+    }
 
     fun setupPhotos(): List<Uri> = session.listPromptPhotos("setup", pendingLabel.trim())
 
@@ -162,14 +208,26 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     fun importPromptPhotos(uris: List<Uri>) {
         val kind = photoPrompt ?: return
+        val ownerFolder = photoPromptResultUid
+            ?.let { uid -> results.firstOrNull { it.uid == uid }?.shotFolder }
+            ?.takeIf { it.isNotBlank() }
         var added = 0
         for (uri in uris) {
-            if (session.importPromptPhoto(kind, pendingLabel.trim(), uri)) added++
+            val imported = if (kind == "after" && ownerFolder != null) {
+                session.importPhoto(ownerFolder, uri)
+            } else {
+                session.importPromptPhoto(kind, pendingLabel.trim(), uri)
+            }
+            if (imported) added++
         }
         if (added > 0) {
             photoCount += added
             photoRevision++
-            if (kind == "after") autoThumbnailForFirstResultPhoto(results.firstOrNull()?.uid)
+            if (kind == "after") {
+                autoThumbnailForFirstResultPhoto(
+                    photoPromptResultUid ?: results.firstOrNull()?.uid
+                )
+            }
             if (kind == "setup") updateSetupPhotosNeeded(false)
         }
     }
@@ -177,11 +235,19 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     /** Image URIs already saved in a result's folder (thumbnails). */
     fun photosFor(r: TestResult): List<Uri> = session.listPhotos(r.shotFolder)
 
-    fun photoSaved(ok: Boolean, uri: Uri) {
+    fun completePhotoCapture(ok: Boolean) {
+        val uri = pendingCameraUri ?: return
+        pendingCameraUri = null
+        prefs.edit().remove("pendingCameraUri").apply()
         if (ok) {
             photoCount++
             photoRevision++
-            if (photoPrompt == "after") autoThumbnailForFirstResultPhoto(results.firstOrNull()?.uid, uri)
+            if (photoPrompt == "after") {
+                autoThumbnailForFirstResultPhoto(
+                    photoPromptResultUid ?: results.firstOrNull()?.uid,
+                    uri,
+                )
+            }
             if (photoPrompt == "setup") updateSetupPhotosNeeded(false)
         }
         else runCatching {
@@ -307,9 +373,12 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
 
-        // A camera capture can kill the process mid-session; restore that prompt.
+        // A camera capture can kill the process mid-session. Resume the photo
+        // dialog solely from its persisted state: setupDone is device-keyed by
+        // MCU serial, which is unavailable until BLE reconnects and therefore
+        // cannot safely gate camera restoration.
         photoPrompt = prefs.getString("photoPrompt", null)
-        if (photoPrompt != null && setupDone) {
+        if (photoPrompt != null) {
             screen = Screen.DASHBOARD
             when (prefs.getString("uiMode", "")) {
                 "sim" -> ble.connectSimulated()
@@ -328,20 +397,43 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
      *  that appears after (re)connecting, before the after-photos prompt. */
     val newShots = mutableStateListOf<TestResult>()
     private val pendingTraceUids = mutableMapOf<Int, String>()
+    private val seenResultKeys = linkedSetOf<String>().apply {
+        prefs.getString("seenResultKeys", "")
+            .orEmpty()
+            .lineSequence()
+            .filter { it.isNotBlank() }
+            .forEach(::add)
+    }
 
     fun dismissShotReview() {
+        val photoOwnerUid = newShots.lastOrNull()?.uid ?: results.firstOrNull()?.uid
         newShots.clear()
-        showPhotoPrompt("after")
+        showPhotoPrompt("after", photoOwnerUid)
     }
 
     private fun onRawResult(r: RawResult) {
+        val resultKey = if (r.bootId != 0L) {
+            "${r.bootId}:${r.id}"
+        } else {
+            "legacy:${r.id}:${r.splitNs}:${r.epochSec}"
+        }
         // FETCH after a reconnect can re-deliver a result we already stored.
         val existing = results.firstOrNull {
-            it.deviceResultId == r.id && it.splitNs == r.splitNs &&
-                (r.bootId == 0L || it.bootId == 0L || it.bootId == r.bootId)
+            it.deviceResultId == r.id && if (r.bootId != 0L && it.bootId != 0L) {
+                it.bootId == r.bootId
+            } else {
+                it.splitNs == r.splitNs
+            }
         }
         val traceCapable =
-            ((ble.hwInfo.value?.capabilities ?: 0) and Proto.CAP_EDGE_TRACE) != 0
+            r.fwMajor >= 3 ||
+                ((ble.hwInfo.value?.capabilities ?: 0) and Proto.CAP_EDGE_TRACE) != 0
+        if (existing == null && resultKey in seenResultKeys) {
+            // The result was already committed before an activity/process
+            // recreation. Never roll a second test folder for a BLE re-delivery.
+            ble.sendCommand(Proto.CMD_ACK, r.id)
+            return
+        }
         if (existing == null) {
             val rec = TestResult(
                 uid = UUID.randomUUID().toString(),
@@ -374,6 +466,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             rec.thumbnailUri = session.listPhotos(rec.shotFolder).firstOrNull()?.toString() ?: ""
             results.add(0, rec)
             persist()
+            rememberResultKey(resultKey)
             prefs.edit()
                 .putString("pendShotType", pendingShotType.ifBlank { "Standard" })
                 .putString("pendTool", pendingTool)
@@ -396,11 +489,29 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 ble.sendCommand(Proto.CMD_ACK, r.id)
             }
         } else if (traceCapable && !existing.hasWaveform) {
+            rememberResultKey(resultKey)
             pendingTraceUids[r.id] = existing.uid
             ble.sendCommand(Proto.CMD_FETCH_TRACE, r.id)
         } else {
+            rememberResultKey(resultKey)
             ble.sendCommand(Proto.CMD_ACK, r.id)
         }
+    }
+
+    private fun rememberResultKey(key: String) {
+        seenResultKeys.remove(key)
+        seenResultKeys.add(key)
+        while (seenResultKeys.size > 128) {
+            seenResultKeys.remove(seenResultKeys.first())
+        }
+        prefs.edit().putString("seenResultKeys", seenResultKeys.joinToString("\n")).apply()
+    }
+
+    fun requestWaveform(uid: String) {
+        val result = results.firstOrNull { it.uid == uid } ?: return
+        if (result.isManual || result.deviceResultId < 0 || result.hasWaveform) return
+        pendingTraceUids[result.deviceResultId] = uid
+        ble.sendCommand(Proto.CMD_FETCH_TRACE, result.deviceResultId)
     }
 
     private fun onRawTrace(trace: RawTrace) {
@@ -531,7 +642,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         results.add(0, rec)
         persist()
         pendingLabel = session.suggestedLabel()
-        showPhotoPrompt("after")
+        showPhotoPrompt("after", rec.uid)
     }
 
     fun setResultThumbnail(uid: String, uri: String) {

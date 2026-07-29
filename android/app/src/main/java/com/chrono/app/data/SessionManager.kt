@@ -108,6 +108,12 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         return createUriAt(rel, "${kind}_${System.currentTimeMillis()}.jpg", "image/jpeg")
     }
 
+    /** Create a photo directly inside a result's immutable owning folder. */
+    fun newPhotoUriInFolder(rel: String, kind: String): Uri? =
+        rel.takeIf { it.isNotBlank() }?.let {
+            createUriAt(it, "${kind}_${System.currentTimeMillis()}.jpg", "image/jpeg")
+        }
+
     fun listPromptPhotos(kind: String, label: String): List<Uri> =
         readablePhotoRel(kind, label)?.let { listPhotos(it) } ?: emptyList()
 

@@ -1,5 +1,6 @@
 # Development Log
 
+- 2026-07-29: Fixed camera-return setup recovery, retained pending camera URIs, bound after photos to the recorded result folder, added persistent BLE result deduplication, and exposed waveform retry/review actions.
 - 2026-07-29: Created the existing-hardware Waveform Review edition with high/low edge traces, CRC-checked BLE chunks, reconnect-safe ACK handling, scaled two-channel rendering, selectable cursors, reviewed timing, simulation, and waveform exports.
 - 2026-07-07: Added simulation training parity for buffered reconnect results and MCU serial tracking in firmware, app logs, and exports.
 - 2026-07-07: Renamed shot log fields for disruptor use, added loading/projectile/pass-fail/notes, and replaced CI display with calibration-informed Guaranteed Accuracy Envelope.
