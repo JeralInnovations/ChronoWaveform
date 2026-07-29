@@ -245,7 +245,7 @@ struct __attribute__((packed)) CalResult {
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
 const uint8_t FW_MAJOR = 3;
-const uint8_t FW_MINOR = 1;
+const uint8_t FW_MINOR = 2;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -870,8 +870,15 @@ void notifyTrace(const Pending& p) {
     packet[payloadLen + 1] = (uint8_t)(crc >> 8);
     uint16_t packetLen = payloadLen + 2;
     chTrace.write(packet, packetLen);
-    chTrace.notify(packet, packetLen);
-    delay(15);
+    // Do not silently drop a chunk when the SoftDevice notification queue is
+    // briefly full. Android can only assemble and display a complete trace.
+    bool sent = false;
+    for (uint8_t attempt = 0; attempt < 20 && !sent; attempt++) {
+      sent = chTrace.notify(packet, packetLen);
+      if (!sent) delay(5);
+    }
+    if (!sent) return;
+    delay(10);
   }
 }
 
@@ -1167,6 +1174,11 @@ void setup() {
   resetCause = startupResetCause;
   NRF_POWER->RESETREAS = resetCause;
 
+  // Waveform chunks are up to 178 bytes. The Bluefruit default MTU is only
+  // 23 bytes and silently fragments a long notify into callbacks that are not
+  // individually valid trace packets. Advertise a large peripheral MTU before
+  // starting the SoftDevice; Android negotiates 185 bytes for this protocol.
+  Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
   Bluefruit.begin();
   Bluefruit.setTxPower(4);
   char advertisedName[12];

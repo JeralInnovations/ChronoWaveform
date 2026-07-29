@@ -69,7 +69,8 @@ data class TestResult(
     val signedSplitNs: Long get() = if (isReversed) -abs(splitNs) else splitNs
     val effectiveSplitNs: Long get() = reviewedSplitNs ?: signedSplitNs
     val isWaveformReviewed: Boolean get() = reviewedSplitNs != null
-    val hasWaveform: Boolean get() = traceFormatVersion > 0
+    val hasWaveform: Boolean get() =
+        traceFormatVersion > 0 && traceData.isNotBlank()
     val splitSeconds: Double get() = effectiveSplitNs / 1_000_000_000.0
     val splitMillis: Double get() = effectiveSplitNs / 1_000_000.0
     val metersPerSecond: Double

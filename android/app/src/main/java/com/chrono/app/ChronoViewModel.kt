@@ -501,6 +501,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
      *  that appears after (re)connecting, before the after-photos prompt. */
     val newShots = mutableStateListOf<TestResult>()
     private val pendingTraceUids = mutableMapOf<Int, String>()
+    private val waveformTransferStatus = mutableStateMapOf<String, String>()
+    private val waveformRetryJobs = mutableMapOf<String, Job>()
     private val seenResultKeys = linkedSetOf<String>().apply {
         prefs.getString("seenResultKeys", "")
             .orEmpty()
@@ -538,8 +540,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (existing != null) {
             rememberResultKey(resultKey)
             if (traceCapable && !existing.hasWaveform) {
-                pendingTraceUids[r.id] = existing.uid
-                ble.sendCommand(Proto.CMD_FETCH_TRACE, r.id)
+                beginWaveformFetch(existing)
             } else {
                 ble.sendCommand(Proto.CMD_ACK, r.id)
             }
@@ -607,8 +608,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             setSensorReady(1, false)
             setSensorReady(2, false)
             if (traceCapable) {
-                pendingTraceUids[r.id] = rec.uid
-                ble.sendCommand(Proto.CMD_FETCH_TRACE, r.id)
+                beginWaveformFetch(rec)
             } else {
                 ble.sendCommand(Proto.CMD_ACK, r.id)
             }
@@ -627,14 +627,46 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     fun requestWaveform(uid: String) {
         val result = results.firstOrNull { it.uid == uid } ?: return
         if (result.isManual || result.deviceResultId < 0 || result.hasWaveform) return
+        beginWaveformFetch(result)
+    }
+
+    fun waveformStatusFor(uid: String): String? = waveformTransferStatus[uid]
+
+    private fun beginWaveformFetch(result: TestResult) {
+        val uid = result.uid
+        val resultId = result.deviceResultId
         pendingTraceUids[result.deviceResultId] = uid
-        ble.sendCommand(Proto.CMD_FETCH_TRACE, result.deviceResultId)
+        waveformTransferStatus[uid] = "Receiving waveform..."
+        ble.sendCommand(Proto.CMD_FETCH_TRACE, resultId)
+
+        waveformRetryJobs.remove(uid)?.cancel()
+        waveformRetryJobs[uid] = viewModelScope.launch {
+            repeat(2) { retry ->
+                delay(2_500)
+                val current = results.firstOrNull { it.uid == uid }
+                if (current == null || current.hasWaveform) return@launch
+                waveformTransferStatus[uid] = "Retrying waveform ${retry + 1}/2..."
+                pendingTraceUids[resultId] = uid
+                ble.sendCommand(Proto.CMD_FETCH_TRACE, resultId)
+            }
+            delay(2_500)
+            if (results.firstOrNull { it.uid == uid }?.hasWaveform == false) {
+                waveformTransferStatus[uid] =
+                    "Waveform was not received. Tap Retry waveform."
+            }
+        }
     }
 
     private fun onRawTrace(trace: RawTrace) {
         val uid = pendingTraceUids.remove(trace.resultId)
             ?: results.firstOrNull { it.deviceResultId == trace.resultId && !it.hasWaveform }?.uid
             ?: return
+        if (trace.events.isEmpty()) {
+            waveformRetryJobs.remove(uid)?.cancel()
+            waveformTransferStatus[uid] =
+                "The logger returned no waveform edges. Tap Retry waveform."
+            return
+        }
         val index = results.indexOfFirst { it.uid == uid }
         if (index < 0) return
         val updated = results[index].copy(
@@ -646,6 +678,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         results[index] = updated
         val newIndex = newShots.indexOfFirst { it.uid == uid }
         if (newIndex >= 0) newShots[newIndex] = updated
+        waveformRetryJobs.remove(uid)?.cancel()
+        waveformTransferStatus.remove(uid)
         persist()
         ble.sendCommand(Proto.CMD_ACK, trace.resultId)
     }

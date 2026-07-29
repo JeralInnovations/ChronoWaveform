@@ -351,6 +351,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     onOpenPhoto = { fullscreenPhoto = it to r.uid },
                     onReviewWaveform = { waveformReviewUid = r.uid },
                     onFetchWaveform = { vm.requestWaveform(r.uid) },
+                    waveformStatus = vm.waveformStatusFor(r.uid),
                 )
             }
         }
@@ -461,6 +462,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             it.firmwareVersion.startsWith("3.") && !it.hasWaveform
         }
         val waitingForWaveform = waitingWaveformShot != null
+        val waveformStatus = waitingWaveformShot?.let { vm.waveformStatusFor(it.uid) }
         AlertDialog(
             onDismissRequest = { vm.dismissShotReview() },
             title = {
@@ -545,7 +547,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                                 color = Amber,
                             )
                             Spacer(Modifier.size(10.dp))
-                            Text("Receiving waveform…", color = TextDim)
+                            Text(waveformStatus ?: "Receiving waveform...", color = TextDim)
                         }
                     }
                 }
@@ -967,6 +969,7 @@ private fun FullLogDialog(
                             onOpenPhoto = { onOpenPhoto(it, r.uid) },
                             onReviewWaveform = { onReviewWaveform(r) },
                             onFetchWaveform = { onFetchWaveform(r) },
+                            waveformStatus = vm.waveformStatusFor(r.uid),
                         )
                         val photos = vm.photosFor(r)
                         if (photos.isNotEmpty()) {
@@ -1668,6 +1671,7 @@ private fun ResultCard(
     onOpenPhoto: (android.net.Uri) -> Unit,
     onReviewWaveform: (() -> Unit)? = null,
     onFetchWaveform: (() -> Unit)? = null,
+    waveformStatus: String? = null,
 ) {
     // Resolve the cover image off the main thread: chosen thumbnail, else first photo.
     val cover by androidx.compose.runtime.produceState<android.net.Uri?>(
@@ -1730,6 +1734,18 @@ private fun ResultCard(
                     color = if (r.isManual) Teal else TextDim,
                 )
                 if (r.hasWaveform && onReviewWaveform != null) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(
+                        "SHOT WAVEFORM",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextDim,
+                    )
+                    Spacer(Modifier.height(5.dp))
+                    WaveformPreview(
+                        result = r,
+                        onClick = onReviewWaveform,
+                        modifier = Modifier.fillMaxWidth().height(130.dp),
+                    )
                     Spacer(Modifier.height(6.dp))
                     OutlinedButton(onClick = onReviewWaveform) {
                         Icon(Icons.Filled.AccessTime, null, modifier = Modifier.size(16.dp))
@@ -1742,6 +1758,10 @@ private fun ResultCard(
                     onFetchWaveform != null
                 ) {
                     Spacer(Modifier.height(6.dp))
+                    waveformStatus?.let {
+                        Text(it, style = MaterialTheme.typography.bodySmall, color = TextDim)
+                        Spacer(Modifier.height(4.dp))
+                    }
                     OutlinedButton(onClick = onFetchWaveform) {
                         Icon(Icons.Filled.AccessTime, null, modifier = Modifier.size(16.dp))
                         Spacer(Modifier.size(6.dp))
