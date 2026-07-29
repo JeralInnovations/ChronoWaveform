@@ -59,7 +59,20 @@ connector pins never see more than the clamped ~20 V.
 | R_bleed | Resistor | **470 kΩ** | baseline stability; do NOT drop below ~100 k |
 | TVS | Bidirectional TVS | **P4KE15CA** | clamps piezo spike to ~20 V; low‑cap |
 | R_series | Resistor | **1 kΩ** | limits clamp current (~16 mA worst case) |
-| D_hi, D_lo | Schottky ×2 | **1N5711** | low‑cap (~2 pF) for timing; keep at the pin |
+| D_hi, D_lo | Schottky ×2 | **1N5711** (see sourcing note) | low‑cap (~2 pF) for timing; keep at the pin |
+
+> **1N5711 sourcing (2026):** the axial DO-35 1N5711 is obsolete at authorized
+> distributors (ST EOL July 2025; the remaining Microchip JAN parts cost $6+).
+> Options, in order of preference:
+> 1. **1N5711W-7-F** (Diodes Inc., SOD-123, Active, ~$0.21, deep DigiKey stock)
+>    — the same 70 V / 15 mA / 2 pF spec in a large, easily hand-soldered SMD.
+>    Give the board a dual DO-35 + SOD-123 footprint so either fits.
+> 2. **BAS40-05 / BAS40-04** (SOT-23 dual, ~5 pF, Active) — one package per
+>    channel replaces both clamps; same family used on the advanced board.
+> 3. Legacy DO-35 stock from Amazon/eBay is acceptable for prototypes — and the
+>    app's bare-port baseline sweep doubles as a counterfeit check: a fake or
+>    relabeled part shows up as an elevated capacitance signature and/or a
+>    shifted baseline offset versus the expected values.
 | R_cal | Resistor | **10 kΩ 1 %** | RC calibration reference (tolerance matters) |
 
 **Shared:**

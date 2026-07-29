@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
@@ -34,6 +35,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextField
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -284,9 +286,16 @@ fun SensorSetupScreen(
     val baselineEntry = vm.calData["b$sensor"]
     val loadEntry = vm.calData["l$sensor"]
     val role = if (sensor == 1) "START" else "STOP"
+    val scrollState = rememberScrollState()
+
+    // Successful detection adds status content above the action area. Keep the
+    // newly enabled Continue button visible instead of requiring a manual swipe.
+    LaunchedEffect(wasVerified, scrollState.maxValue) {
+        if (wasVerified) scrollState.animateScrollTo(scrollState.maxValue)
+    }
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(28.dp).verticalScroll(rememberScrollState()),
+        modifier = Modifier.fillMaxSize().padding(28.dp).verticalScroll(scrollState),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Spacer(Modifier.height(20.dp))
@@ -449,12 +458,22 @@ fun DistanceScreen(vm: ChronoViewModel) {
     var text by remember {
         mutableStateOf(if (vm.distanceValue > 0) trimZeros(vm.distanceInUnit()) else "")
     }
+    var measurementErrorText by remember {
+        mutableStateOf(trimZeros(vm.measurementErrorValue))
+    }
     var unit by remember { mutableStateOf(vm.distanceUnit) }
+    var errorUnit by remember { mutableStateOf(vm.measurementErrorUnit) }
     var menuOpen by remember { mutableStateOf(false) }
+    var errorMenuOpen by remember { mutableStateOf(false) }
     val value = text.replace(',', '.').toDoubleOrNull()
+    val measurementError = measurementErrorText.replace(',', '.').toDoubleOrNull()
 
     Column(
-        modifier = Modifier.fillMaxSize().padding(28.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .imePadding()
+            .verticalScroll(rememberScrollState())
+            .padding(28.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Spacer(Modifier.height(20.dp))
@@ -492,7 +511,66 @@ fun DistanceScreen(vm: ChronoViewModel) {
                     DistanceUnit.entries.forEach { u ->
                         DropdownMenuItem(
                             text = { Text(u.label) },
-                            onClick = { unit = u; menuOpen = false },
+                            onClick = {
+                                val oldUnit = unit
+                                value?.let { text = trimZeros(it * oldUnit.toMeters / u.toMeters) }
+                                unit = u
+                                menuOpen = false
+                            },
+                        )
+                    }
+                }
+            }
+        }
+        Spacer(Modifier.height(18.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            OutlinedTextField(
+                value = measurementErrorText,
+                onValueChange = { measurementErrorText = it },
+                modifier = Modifier.weight(1f),
+                label = {
+                    SetupFieldLabel(
+                        "MEASUREMENT ERROR",
+                        "Your estimated +/- error when measuring the START-to-STOP spacing. " +
+                            "For example, enter 0.25 and select in for a spacing measured " +
+                            "to +/- 0.25 in. This is combined with timing uncertainty in " +
+                            "the Guaranteed Accuracy Envelope (GAE).",
+                    )
+                },
+                prefix = { Text("+/-") },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+            )
+            Spacer(Modifier.size(12.dp))
+            ExposedDropdownMenuBox(
+                expanded = errorMenuOpen,
+                onExpandedChange = { errorMenuOpen = it },
+            ) {
+                TextField(
+                    value = errorUnit.label,
+                    onValueChange = {},
+                    readOnly = true,
+                    modifier = Modifier.menuAnchor().size(width = 96.dp, height = 56.dp),
+                    trailingIcon = {
+                        ExposedDropdownMenuDefaults.TrailingIcon(expanded = errorMenuOpen)
+                    },
+                )
+                ExposedDropdownMenu(
+                    expanded = errorMenuOpen,
+                    onDismissRequest = { errorMenuOpen = false },
+                ) {
+                    DistanceUnit.entries.forEach { u ->
+                        DropdownMenuItem(
+                            text = { Text(u.label) },
+                            onClick = {
+                                val oldUnit = errorUnit
+                                measurementError?.let {
+                                    measurementErrorText =
+                                        trimZeros(it * oldUnit.toMeters / u.toMeters)
+                                }
+                                errorUnit = u
+                                errorMenuOpen = false
+                            },
                         )
                     }
                 }
@@ -500,16 +578,20 @@ fun DistanceScreen(vm: ChronoViewModel) {
         }
         Spacer(Modifier.height(18.dp))
         Text(
-            "This distance is used for velocity and GAE. A small spacing error changes every shot measurement.",
+            "Spacing sets velocity directly. Measurement Error is included in every GAE result.",
             style = MaterialTheme.typography.bodyLarge,
             color = TextDim,
             textAlign = TextAlign.Center,
         )
 
-        Spacer(Modifier.weight(1f))
+        Spacer(Modifier.height(32.dp))
         Button(
-            onClick = { vm.saveDistance(value ?: 0.0, unit) },
-            enabled = value != null && value > 0,
+            onClick = {
+                vm.saveDistance(value ?: 0.0, unit, measurementError ?: 0.0, errorUnit)
+            },
+            enabled = value != null && value > 0 && measurementError != null &&
+                measurementError >= 0 &&
+                measurementError * errorUnit.toMeters < value * unit.toMeters,
             modifier = Modifier.fillMaxWidth().height(54.dp),
         ) { Text("Save distance") }
     }

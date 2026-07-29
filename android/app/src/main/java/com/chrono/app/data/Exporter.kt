@@ -29,7 +29,8 @@ object Exporter {
                     "mcu_serial,hardware_revision,firmware_version,battery_mv,boot_id,reset_cause," +
                     "result_flags,port_flags,raw_start_ticks,raw_stop_ticks,format_version,crc_valid," +
                     "timing_fault,split_time,automatic_split_ns,reviewed_split_ns,effective_split_ns," +
-                    "split_ms,distance_m,velocity_mps,velocity_fps,waveform_reviewed," +
+                    "split_ms,distance_m,measurement_error_m,measurement_error_unit," +
+                    "velocity_mps,velocity_fps,waveform_reviewed," +
                     "trace_format,trace_flags,trace_event_count"
             )
             for (r in results) {
@@ -47,10 +48,12 @@ object Exporter {
                         r.resetCause + "," + r.resultFlags + "," + r.portFlags + "," +
                         r.rawStartTicks + "," + r.rawStopTicks + "," + r.formatVersion + "," +
                         r.crcValid + "," + esc(r.timingFaultText().orEmpty()) + "," +
-                        esc(r.splitTimeText()) + "," + r.splitNs + "," +
+                        esc(r.splitTimeText()) + "," + r.signedSplitNs + "," +
                         (r.reviewedSplitNs ?: "") + "," + r.effectiveSplitNs + "," +
                         String.format(Locale.US, "%.6f", r.splitMillis) + "," +
                         String.format(Locale.US, "%.5f", r.distanceM) + "," +
+                        String.format(Locale.US, "%.5f", r.measurementErrorM) + "," +
+                        r.measurementErrorUnit + "," +
                         String.format(Locale.US, "%.3f", r.metersPerSecond) + "," +
                         String.format(Locale.US, "%.2f", r.feetPerSecond) + "," +
                         r.isWaveformReviewed + "," + r.traceFormatVersion + "," +

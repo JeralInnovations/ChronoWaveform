@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.LazyColumn
@@ -94,6 +95,7 @@ import com.chrono.app.ble.HealthStatus
 import com.chrono.app.ble.Proto
 import com.chrono.app.ble.SimFault
 import com.chrono.app.data.Exporter
+import com.chrono.app.data.DistanceUnit
 import com.chrono.app.data.TARGET_DIST_UNITS
 import com.chrono.app.data.TestResult
 import com.chrono.app.ui.theme.Amber
@@ -274,9 +276,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     running = running,
                     connected = (connState == ConnState.CONNECTED || connState == ConnState.RECONNECTING) &&
                         state != Proto.ST_CHECKING,
-                    sensorsReady = vm.sensor1Ready && vm.sensor2Ready &&
-                        deviceStatus?.batteryLocked != true,
-                    batteryLocked = deviceStatus?.batteryLocked == true,
+                    sensorsReady = vm.sensor1Ready && vm.sensor2Ready,
                     onArm = { vm.arm() },
                     onDisarm = { vm.disarm() },
                 )
@@ -287,6 +287,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     SetupPhotoStrip(
                         photos = setupPhotos,
                         selected = selectedSetupPhoto,
+                        onAdd = { vm.requestSetupPhotos() },
                         onOpen = { promptPhotoPreview = it },
                         onSelect = { selectedSetupPhoto = if (selectedSetupPhoto == it) null else it },
                         onDelete = {
@@ -344,6 +345,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     r,
                     latest = r == vm.results.firstOrNull(),
                     accuracyEnvelopePercent = vm.accuracyEnvelopePercentFor(r),
+                    photoRevision = photoRevision,
                     coverFor = { vm.photosFor(r) },
                     onEdit = { editing = r },
                     onOpenPhoto = { fullscreenPhoto = it to r.uid },
@@ -474,7 +476,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                         )
                         Row(verticalAlignment = Alignment.Bottom) {
                             Text(
-                                "%.1f".format(s.feetPerSecond),
+                                "%.1f%s".format(s.feetPerSecond, s.reversedMarker),
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 26.sp,
                                 color = Amber,
@@ -491,6 +493,18 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                         Text(
                             "%.2f m/s".format(s.metersPerSecond),
                             color = TextDim,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        val gae = vm.accuracyEnvelopePercentFor(s)
+                        val velocityErrorFps = kotlin.math.abs(s.feetPerSecond) * gae / 100.0
+                        Text(
+                            if (gae >= 0.05) {
+                                "Estimated error  +/- %.1f%% GAE  (+/- %.1f ft/s)"
+                                    .format(gae, velocityErrorFps)
+                            } else {
+                                "Estimated error  +/- <0.1% GAE"
+                            },
+                            color = Teal,
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         if (s.label.isNotBlank()) {
@@ -566,6 +580,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     vm.resultPrompt?.let { r ->
         EditResultDialog(
             result = r,
+            photoRevision = photoRevision,
             title = "Log result",
             dismissText = "Close",
             showDelete = false,
@@ -589,6 +604,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     editing?.let { r ->
         EditResultDialog(
             result = r,
+            photoRevision = photoRevision,
             onDismiss = { editing = null },
             onSave = { label, shotType, tool, target, tdVal, tdUnit, loading, projectile, passFail, notes, epochMillis ->
                 vm.updateResult(
@@ -643,7 +659,10 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Column(
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(24.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
                     OutlinedButton(onClick = {
@@ -665,6 +684,9 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
         vm.results.firstOrNull { it.uid == uid }?.let { result ->
             WaveformReviewDialog(
                 result = result,
+                accuracyEnvelopePercentForSplit = { splitNs ->
+                    vm.accuracyEnvelopePercentForSelection(result, splitNs)
+                },
                 onDismiss = { waveformReviewUid = null },
                 onApply = { start, stop ->
                     vm.applyReviewedTiming(uid, start, stop)
@@ -696,7 +718,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             title = { Text("Low logger battery") },
             text = {
                 Text(
-                    "The connected logger battery is low. Recharge or replace it before relying on another shot.",
+                    "The logger battery is low. It will keep trying to record shots, but very low voltage can cause a reset. Recharge it soon.",
                     style = MaterialTheme.typography.bodyLarge,
                 )
             },
@@ -810,7 +832,10 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     "Tap image to close",
                     style = MaterialTheme.typography.bodyMedium,
                     color = Color.White.copy(alpha = 0.7f),
-                    modifier = Modifier.align(Alignment.BottomCenter).padding(24.dp),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .navigationBarsPadding()
+                        .padding(24.dp),
                 )
             }
         }
@@ -821,6 +846,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
 private fun SetupPhotoStrip(
     photos: List<android.net.Uri>,
     selected: android.net.Uri?,
+    onAdd: () -> Unit,
     onOpen: (android.net.Uri) -> Unit,
     onSelect: (android.net.Uri) -> Unit,
     onDelete: () -> Unit,
@@ -838,6 +864,11 @@ private fun SetupPhotoStrip(
                 color = TextDim,
                 modifier = Modifier.weight(1f),
             )
+            TextButton(onClick = onAdd) {
+                Icon(Icons.Filled.PhotoCamera, null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.size(6.dp))
+                Text("Add")
+            }
             if (selected != null) {
                 TextButton(onClick = onDelete) {
                     Icon(Icons.Filled.Delete, null, tint = Bad, modifier = Modifier.size(16.dp))
@@ -900,6 +931,7 @@ private fun FullLogDialog(
     onReviewWaveform: (TestResult) -> Unit,
     onFetchWaveform: (TestResult) -> Unit,
 ) {
+    val photoRevision = vm.photoRevision
     Dialog(
         onDismissRequest = onExit,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -929,6 +961,7 @@ private fun FullLogDialog(
                             r = r,
                             latest = r == vm.results.firstOrNull(),
                             accuracyEnvelopePercent = vm.accuracyEnvelopePercentFor(r),
+                            photoRevision = photoRevision,
                             coverFor = { vm.photosFor(r) },
                             onEdit = { onEdit(r) },
                             onOpenPhoto = { onOpenPhoto(it, r.uid) },
@@ -1075,10 +1108,6 @@ private fun BatteryIndicator(deviceStatus: DeviceStatus?, compact: Boolean = fal
             if (isNotEmpty()) append(" ")
             append(String.format("%.2fV", mv / 1000.0))
         }
-        if (deviceStatus?.batteryLocked == true) {
-            if (isNotEmpty()) append(" ")
-            append("ARM LOCK")
-        }
     }
 
     Spacer(Modifier.size(if (compact) 8.dp else 14.dp))
@@ -1152,12 +1181,15 @@ private fun PortHealthCard(
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.fillMaxWidth().padding(18.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("PORT HEALTH", style = MaterialTheme.typography.labelSmall,
-                    color = TextDim, modifier = Modifier.weight(1f))
-                TextButton(onClick = onIdentify, enabled = enabled) { Text("Identify") }
+            Text("PORT HEALTH", style = MaterialTheme.typography.labelSmall, color = TextDim)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onIdentify, enabled = enabled) { Text("Flash LED") }
                 TextButton(onClick = onCheck, enabled = enabled && !checking) {
-                    Text(if (checking) "Checking..." else "Check")
+                    Text(if (checking) "Checking..." else "Check ports")
                 }
             }
             if (health == null || health.checkedAtBootMs == 0L) {
@@ -1168,7 +1200,7 @@ private fun PortHealthCard(
                     Row(Modifier.fillMaxWidth().padding(top = 6.dp)) {
                         Text("CH$channel", modifier = Modifier.weight(0.25f), color = TextDim)
                         Text(
-                            port.summary(),
+                            "${port.summary()} - ${healthSignatureText(port.signatureNs)}",
                             modifier = Modifier.weight(0.75f),
                             color = when {
                                 port.serious -> Bad
@@ -1193,6 +1225,12 @@ private fun PortHealthCard(
             }
         }
     }
+}
+
+private fun healthSignatureText(ns: Long): String = when {
+    ns >= 1_000_000L -> "${trimZeros(ns / 1_000_000.0)} ms"
+    ns >= 1_000L -> "${trimZeros(ns / 1_000.0)} us"
+    else -> "$ns ns"
 }
 
 /**
@@ -1229,6 +1267,12 @@ private fun RigCard(vm: ChronoViewModel, enabled: Boolean) {
                         )
                     }
                     Text(
+                        "Measurement Error: +/- ${trimZeros(vm.measurementErrorValue)} " +
+                            vm.measurementErrorUnit.label,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = TextDim,
+                    )
+                    Text(
                         "tap to change",
                         style = MaterialTheme.typography.labelSmall,
                         color = TextDim,
@@ -1242,8 +1286,8 @@ private fun RigCard(vm: ChronoViewModel, enabled: Boolean) {
                             )
                             Spacer(Modifier.size(6.dp))
                             InfoDot(
-                                "GAE",
-                                "GAE means Guaranteed Accuracy Envelope. It is the app's conservative +/- percent range around the measured velocity. For example, 1000 ft/s with +/- 2% GAE means the measurement should be treated as about 980 to 1020 ft/s. The app builds that percent from timer resolution, clock drift, edge jitter, sensor spacing uncertainty, and calibration data. Faster shots and shorter sensor spacing widen the envelope because the same timing error is a larger share of the measurement. Closely matched channel calibration narrows it.",
+                                "Guaranteed Accuracy Envelope (GAE)",
+                                "The Guaranteed Accuracy Envelope (GAE) is the app's conservative +/- percent range around the measured velocity. For example, 1000 ft/s with +/- 2% GAE means the measurement should be treated as about 980 to 1020 ft/s. The app combines timer resolution, clock drift, edge jitter, your entered Measurement Error, and calibration data. Faster shots and shorter sensor spacing widen the envelope because the same timing error is a larger share of the measurement. Closely matched channel calibration narrows it.",
                             )
                         }
                     }
@@ -1419,6 +1463,7 @@ private fun ChannelsCard(vm: ChronoViewModel, enabled: Boolean) {
 @Composable
 private fun NextTestCard(vm: ChronoViewModel, armed: Boolean) {
     val fieldText = MaterialTheme.typography.bodyMedium
+    var labelHadFocus by remember { mutableStateOf(false) }
     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 18.dp, vertical = 14.dp)) {
             Text("Next test", style = MaterialTheme.typography.titleMedium)
@@ -1434,7 +1479,13 @@ private fun NextTestCard(vm: ChronoViewModel, armed: Boolean) {
             OutlinedTextField(
                 value = vm.pendingLabel,
                 onValueChange = { vm.pendingLabel = it },
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .onFocusChanged { focus ->
+                        val commit = labelHadFocus && !focus.isFocused
+                        labelHadFocus = focus.isFocused
+                        if (commit) vm.commitPendingLabel()
+                    },
                 label = { FieldLabel("LABEL", "Short name for this shot, such as Test 1 or 20 degree upward angle.") },
                 placeholder = { Text("Test 1", color = TextDim) },
                 textStyle = fieldText,
@@ -1506,7 +1557,6 @@ private fun ArmButton(
     running: Boolean,
     connected: Boolean,
     sensorsReady: Boolean,
-    batteryLocked: Boolean,
     onArm: () -> Unit,
     onDisarm: () -> Unit,
 ) {
@@ -1593,15 +1643,7 @@ private fun ArmButton(
                     Spacer(Modifier.size(10.dp))
                     Text("RECORD", style = MaterialTheme.typography.labelLarge)
                 }
-                if (connected && batteryLocked) {
-                    Text(
-                        "Battery is too low to arm. Charge it above the recovery threshold.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Bad,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    )
-                } else if (connected && !sensorsReady) {
+                if (connected && !sensorsReady) {
                     Text(
                         "Replace and retest both sensors before recording.",
                         style = MaterialTheme.typography.bodyMedium,
@@ -1620,6 +1662,7 @@ private fun ResultCard(
     r: TestResult,
     latest: Boolean,
     accuracyEnvelopePercent: Double,
+    photoRevision: Int,
     coverFor: () -> List<android.net.Uri>,
     onEdit: () -> Unit,
     onOpenPhoto: (android.net.Uri) -> Unit,
@@ -1628,7 +1671,7 @@ private fun ResultCard(
 ) {
     // Resolve the cover image off the main thread: chosen thumbnail, else first photo.
     val cover by androidx.compose.runtime.produceState<android.net.Uri?>(
-        null, r.uid, r.thumbnailUri, r.shotFolder,
+        null, r.uid, r.thumbnailUri, r.shotFolder, photoRevision,
     ) {
         value = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
             r.thumbnailUri.takeIf { it.isNotBlank() }
@@ -1658,7 +1701,11 @@ private fun ResultCard(
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        if (r.metersPerSecond != 0.0) "%.1f".format(r.feetPerSecond) else "—",
+                        if (r.metersPerSecond != 0.0) {
+                            "%.1f%s".format(r.feetPerSecond, r.reversedMarker)
+                        } else {
+                            "—"
+                        },
                         fontFamily = FontFamily.Monospace,
                         fontSize = 36.sp,
                         color = Amber,
@@ -1673,8 +1720,8 @@ private fun ResultCard(
                     r.isManual && r.metersPerSecond != 0.0 ->
                         "%.2f m/s  ·  manual entry".format(r.metersPerSecond)
                     r.isManual -> "manual entry"
-                    else -> "%.2f m/s  -  %s  -  %s".format(
-                        r.metersPerSecond, r.splitTimeText(), envelopeText
+                    else -> "%.2f%s m/s  -  %s  -  %s".format(
+                        r.metersPerSecond, r.reversedMarker, r.splitTimeText(), envelopeText
                     )
                 }
                 Text(
@@ -1954,6 +2001,7 @@ private fun ShotTypeSelector(value: String, onChange: (String) -> Unit) {
 @Composable
 private fun EditResultDialog(
     result: TestResult,
+    photoRevision: Int,
     title: String = "Edit test",
     dismissText: String = "Cancel",
     showDelete: Boolean = true,
@@ -1972,8 +2020,10 @@ private fun EditResultDialog(
     onDelete: () -> Unit,
 ) {
     var photoRefresh by remember { mutableStateOf(0) }
-    val photos = remember(photoRefresh) { photosFor() }
-    var selectedPhoto by remember(photoRefresh) { mutableStateOf<android.net.Uri?>(null) }
+    val photos = remember(photoRefresh, photoRevision) { photosFor() }
+    var selectedPhoto by remember(photoRefresh, photoRevision) {
+        mutableStateOf<android.net.Uri?>(null)
+    }
     val pickImages = rememberLauncherForActivityResult(
         ActivityResultContracts.GetMultipleContents()
     ) { uris ->
@@ -2016,10 +2066,21 @@ private fun EditResultDialog(
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 if (showRecordedValues) {
                     val spacingIn = result.distanceM * 39.3701
-                    val velocityText = if (result.metersPerSecond != 0.0)
-                        "%.1f ft/s".format(result.feetPerSecond) else "Not recorded"
+                    val errorUnit = runCatching {
+                        DistanceUnit.valueOf(result.measurementErrorUnit)
+                    }.getOrDefault(DistanceUnit.INCHES)
+                    val measurementError = result.measurementErrorM / errorUnit.toMeters
+                    val velocityText = if (result.metersPerSecond != 0.0) {
+                        "%.1f%s ft/s".format(result.feetPerSecond, result.reversedMarker)
+                    } else {
+                        "Not recorded"
+                    }
                     ReadOnlyLogValue("Velocity", velocityText)
                     ReadOnlyLogValue("SENSOR SPACING", "%.3f in".format(spacingIn))
+                    ReadOnlyLogValue(
+                        "MEASUREMENT ERROR",
+                        "+/- ${trimZeros(measurementError)} ${errorUnit.label}",
+                    )
                     ReadOnlyLogValue("Split time", result.splitTimeText())
                     if (result.deviceSerial.isNotBlank()) {
                         ReadOnlyLogValue("MCU serial", result.deviceSerial)

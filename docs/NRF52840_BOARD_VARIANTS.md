@@ -50,7 +50,7 @@ precedence over the earlier tuning recommendations below.
 | CH2 STOP input | D1 | Direct clamped sensor node into GPIO |
 | CH1 charge/test | D2 | 10k 1% to CH1 sensor node |
 | CH2 charge/test | D3 | 10k 1% to CH2 sensor node |
-| Wake button | D4 | Momentary button to GND; internal pull-up |
+| Power/wake button | D4 | Momentary button to GND; internal pull-up; debounced 1.5-second hold for System OFF and wake |
 | Status LED | D5 | External LED through 330 ohms, active-high |
 
 Per-channel circuit:

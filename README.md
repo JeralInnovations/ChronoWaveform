@@ -32,8 +32,8 @@ ChronoWaveform/
 
 | Hardware | Sketch | Power and battery behavior | LED |
 |---|---|---|---|
-| Original nice!nano v2 logger | `firmware/ChronographNiceNano/ChronographNiceNano.ino` | 1S LiPo on the board battery/input rail. Firmware reads VDDH with `analogReadVDDHDIV5()` and applies the 3.40 V / 3.50 V arm-lock hysteresis. | GPIO 15 |
-| Economical two-channel PTH logger | `firmware/ChronographXiao/ChronographXiao.ino` | Protected 1S LiPo on the XIAO `BAT+`/`BAT-` pads. Firmware reads the onboard divider and applies the 3.40 V / 3.50 V arm-lock hysteresis. Never feed `3V3`. | D5 through 330 ohms |
+| Original nice!nano v2 logger | `firmware/ChronographNiceNano/ChronographNiceNano.ino` | 1S LiPo on the board battery/input rail. Firmware reads VDDH and reports a low-voltage warning without blocking operation. | GPIO 15 |
+| Economical two-channel PTH logger | `firmware/ChronographXiao/ChronographXiao.ino` | Protected 1S LiPo on the XIAO `BAT+`/`BAT-` pads. Firmware reads the onboard divider and reports a low-voltage warning without blocking operation. Never feed `3V3`. | D5 through 330 ohms |
 
 Both builds use D0/D1 for timing, D2/D3 for RC diagnostics, and D4 for the
 button. The XIAO board reserves D6/D7 for UART and D8/D9 for remappable I2C.
@@ -49,6 +49,10 @@ Additional guides:
 - `docs/NRF52840_BOARD_VARIANTS.md` captures the current two-board PCB layout
   target: a two-channel unbuffered nRF52840 board and a four-channel buffered
   nRF52840 board.
+- `docs/ADVANCED_FOUR_CHANNEL_BUFFERED.md` is the full component/connection
+  plan for the buffered board: window-comparator front-end (any polarity, any
+  reasonable piezo), adjustable sensitivity, BOM, pin map, and firmware/app
+  deltas.
 - `docs/PIEZO_INPUT_PROTECTION.md` records the recommended two-stage piezo
   input protection path and validation plan.
 - `docs/FOUR_CHANNEL_WATERPROOF_BUILD.md` lays out the planned four-channel
@@ -134,8 +138,8 @@ same piezo type, same clamp diodes, and **the same cable length** (~5 ns/m).
 
 | Function | Connection |
 |---|---|
-| Wake/user button | XIAO D4 to momentary switch to GND |
-| Status LED | XIAO D5 through 330 ohms to LED anode; LED cathode to GND |
+| Power button | XIAO D4 to momentary switch to GND; hold 1.5 seconds to turn the logger off or wake it from System OFF; short presses do nothing |
+| Status LED | XIAO D5 through 330 ohms to LED anode; LED cathode to GND. It gives one short heartbeat every 2 seconds while powered, blinks rapidly while armed or timing, stays solid during a port check, double-blinks a fault, and flashes distinctly for power-button holds and the app's Flash LED command |
 | UART reserved | D6 TX and D7 RX |
 | Remappable I2C | D8/D9 |
 
@@ -164,8 +168,16 @@ to the USB connector quickly (like a mouse double-click). The onboard LED breath
 and a new port appears — that's the bootloader. Select that port and upload again.
 
 When running, the device advertises as **`Chrono-XXXX`**, where the suffix is
-derived from its permanent MCU identity. The external D5 LED indicates state
-and flashes rapidly for the app's Identify command.
+derived from its permanent MCU identity. The external D5 LED gives a short
+60 ms heartbeat every 2 seconds while normally powered and blinks rapidly
+(120 ms on, 120 ms off) while armed or actively timing. It stays solid during
+a port check, double-blinks a fault, and uses a separate fast pattern for the
+app's **Flash LED** command.
+
+The D4 power button uses a debounced 1.5-second hold in both directions. A short
+press has no effect. System OFF stops BLE and timing and leaves D4 as the
+active-low wake source. Pending results are currently RAM-backed, so upload them
+before powering off; flash-journaled result persistence remains planned work.
 
 ### nice!nano v2 logger
 
@@ -178,8 +190,8 @@ and flashes rapidly for the app's Identify command.
 4. Select *nice!nano nRF52 -> nice!nano v2* and upload normally.
 
 This build expects a protected 1S LiPo on the nice!nano battery/input rail. Its
-board-specific firmware reads that rail and blocks a new arm at or below 3.40 V;
-the lock releases only after a filtered reading of at least 3.50 V.
+board-specific firmware reads and reports that voltage. Low voltage produces an
+app warning but never blocks a new arm.
 
 ---
 
@@ -242,9 +254,12 @@ it (allow "install from unknown sources" when asked).
    the baseline isolates the cable+sensor load. If the reading looks like an
    empty port, the app warns you the sensor may not be plugged in.
 4. **Sensor 2 (STOP)** — same procedure for port 2.
-5. **Sensor spacing** — enter the measured distance between the sensors
-   (inches by default; mm / cm / ft also available). Velocity is computed from
-   this, so measure carefully. At a 6 in gap, 0.02 in of error is 1%.
+5. **Sensor spacing** — enter the measured distance between the sensors, then
+   enter its **Measurement Error** as a `+/-` value. Spacing and Measurement
+   Error each have their own in / mm / cm / ft selector. Velocity is computed
+   directly from spacing. At a 6 in gap, `+/-0.02 in` contributes about
+   `+/-0.33%`; `+/-0.25 in` contributes about `+/-4.17%` before timing
+   uncertainty is compounded into the GAE.
 
 The dashboard's **Channel calibration** card shows each port's measured load
 (≈ pF) and flags whether the two channels are matched; **Recheck** reruns the
@@ -257,8 +272,11 @@ in any file manager. The **project** folder is per day, named by date (you can
 rename it when it's created); a **new day** prompts you to start a new project
 or keep logging into the previous one — it does *not* prompt after every shot.
 Each **test** is a subfolder named by that shot's label (or `Test1`, `Test2`…
-auto-incrementing when no label is given), holding `shot.json` plus the shot's
-photos. Tap the folder path at the top of the dashboard (or the *Files* button
+auto-incrementing from the folders already present), holding `shot.json` plus
+the shot's photos. The public folders are authoritative: the app rescans them
+when it resumes and when Android reports a file change, so valid outside edits
+to `shot.json`, folder renames, and manually added images appear in the app.
+Tap the folder path at the top of the dashboard (or the *Files* button
 above the results) to open it. After setup the app prompts for **setup photos**
 of the rig; after each shot you first get a **results screen**, then the
 **after photos** prompt. Opening a past shot in the editor shows a row of photo
@@ -279,19 +297,27 @@ every result (label, date, split, distance, velocities) plus the raw
 calibration history (`.jsonl`) through Android's share sheet — email it,
 save to Drive, etc.
 
-**Hardware identification & confidence.** The device reports its hardware
+Saving changes in a result's **Edit** dialog renames that test folder when its
+label changes and updates the folder's canonical `shot.json`; it does not
+create a second JSON file.
+
+**Hardware identification & accuracy.** The device reports its hardware
 revision and timing spec (timer tick, crystal tolerance, front-end jitter)
-over BLE, and each result shows a ~95% confidence interval computed from
-those numbers plus your rig's measured channel mismatch and a 0.5 mm
-gate-spacing assumption. A future hardware revision that reports tighter
-numbers (e.g. a TDC front end) automatically shows tighter confidence — no
-app update needed. Unidentified (older) firmware is assumed to be rev 1.
+over BLE. Each result shows a roughly 99%-style Guaranteed Accuracy Envelope
+(GAE) compounded from those numbers, measured channel mismatch, calibration
+repeatability, and the user's `+/-` Measurement Error. A future hardware revision
+that reports tighter numbers automatically shows a tighter GAE without an app
+update. Unidentified older firmware is assumed to be revision 1.
 
 **Break-screens are consumable.** Every recorded shot automatically marks both
 sensors as consumed on the dashboard's rig diagram (torn amber screens) and
 disables ARM. Fit fresh wire, tap the torn sensor in the diagram to retest it —
 the app re-verifies the trigger and automatically re-measures the new screen's
 electrical load before the next shot can be armed.
+
+Only one result is accepted per completed setup. Repeated BLE delivery is
+deduplicated by logger boot ID plus result ID, and the setup does not reopen for
+another result until both channels have been restored to Ready.
 5. **Dashboard** — from here you can:
    - **Retest 1 / Retest 2** — re-run either sensor test any time
    - **Change** — edit the sensor spacing
@@ -330,6 +356,8 @@ screen. Either way you can walk the entire UI with no chronograph present — ha
 app before the hardware is built. A fake device drives the same screens the real
 one does. The dashboard can select stuck-high, leakage/short, unstable, coupled,
 missing-sensor, STOP-before-START, STOP-timeout, and impossible-split scenarios.
+The reversed-order simulation retains both hardware-style timestamps and shows
+negative split and velocity values with `*` to mark STOP-before-START.
 Time sync and simulated signal loss are also supported. A small **SIM** badge
 marks the session. Tap *Disconnect* to leave.
 
@@ -357,11 +385,12 @@ marks the session. Tap *Disconnect* to leave.
 - **Power-loss boundary** — results are retained through BLE loss and are deleted
   only after the app stores and acknowledges them. The current queue is still in
   RAM, so complete logger power loss before collection can lose pending results.
-- **Battery lockout** — both builds use a protected 1S LiPo and refuse a new
-  arm at or below 3.40 V, releasing it after a filtered reading reaches 3.50 V.
-  The nice!nano reads VDDH with `analogReadVDDHDIV5()`; the XIAO reads its
-  onboard BAT divider with `PIN_VBAT` and `PIN_VBAT_ENABLE`. An in-progress
-  shot is never interrupted.
+- **Battery warning** — both builds measure their protected 1S LiPo and warn in
+  the app when voltage is low. Battery level never blocks arming; the logger
+  keeps trying to capture until its supply can no longer sustain operation.
+- **Fresh app launch** — after connecting, the app starts the setup workflow
+  with sensor readiness unknown. It resumes the dashboard only when the logger
+  is already armed/running or has pending shot data to upload.
 
 ## 6. BLE protocol (for reference / hacking)
 
@@ -369,7 +398,7 @@ Service `a5c40001-9d95-4e4c-8c5a-c1d6f2a80de1`
 
 | Characteristic | UUID (…-9d95-4e4c-8c5a-c1d6f2a80de1) | Access | Payload |
 |---|---|---|---|
-| Status  | `a5c40002` | read/notify | `state, pendingCount, timeValid, batteryPercent, batteryMv, batteryArmLocked` |
+| Status  | `a5c40002` | read/notify | `state, pendingCount, timeValid, batteryPercent, batteryMv, legacyBatteryLock`; the final byte is always 0 in firmware 2.2+ |
 | Control | `a5c40003` | write | `[cmd, argLo, argHi]` |
 | Result  | `a5c40004` | read/notify | v1 prefix plus raw ticks, battery, port flags, boot/reset IDs, revisions, format, CRC |
 | Time    | `a5c40005` | write | unix seconds `u32` (LE) |

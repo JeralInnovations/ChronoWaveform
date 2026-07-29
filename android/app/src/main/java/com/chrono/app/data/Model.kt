@@ -8,6 +8,8 @@ import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.UUID
+import kotlin.math.abs
 
 /** One recorded split. Stored locally in results.json. */
 data class TestResult(
@@ -54,13 +56,18 @@ data class TestResult(
     var reviewedStartOffsetTicks: Long? = null,
     var reviewedStopOffsetTicks: Long? = null,
     var reviewedAtMillis: Long? = null,
+    /** User-entered +/- measurement error, stored with this shot. */
+    var measurementErrorM: Double = 0.0005,
+    var measurementErrorUnit: String = "INCHES",
     /** folder id under ChronoData holding this shot's log and photos */
     var shotFolder: String = "",
     /** user-chosen cover image URI for this shot ("" = use the first photo) */
     var thumbnailUri: String = "",
 ) {
     val isManual: Boolean get() = deviceResultId < 0
-    val effectiveSplitNs: Long get() = reviewedSplitNs ?: splitNs
+    val isReversed: Boolean get() = resultFlags and 0x04 != 0 && splitNs > 0
+    val signedSplitNs: Long get() = if (isReversed) -abs(splitNs) else splitNs
+    val effectiveSplitNs: Long get() = reviewedSplitNs ?: signedSplitNs
     val isWaveformReviewed: Boolean get() = reviewedSplitNs != null
     val hasWaveform: Boolean get() = traceFormatVersion > 0
     val splitSeconds: Double get() = effectiveSplitNs / 1_000_000_000.0
@@ -69,10 +76,11 @@ data class TestResult(
         get() = manualVelocityMps
             ?: if (effectiveSplitNs != 0L && distanceM > 0) distanceM / splitSeconds else 0.0
     val feetPerSecond: Double get() = metersPerSecond * 3.28084
+    val reversedMarker: String get() = if (effectiveSplitNs < 0) "*" else ""
 
     fun timingFaultText(): String? = when {
         resultFlags and 0x80 != 0 -> "High-frequency clock failed to stabilize"
-        resultFlags and 0x04 != 0 -> "STOP triggered before START"
+        resultFlags and 0x04 != 0 -> "STOP triggered before START (* reversed measurement)"
         resultFlags and 0x08 != 0 -> "STOP did not trigger before timeout"
         resultFlags and 0x10 != 0 -> "Split time below allowed range"
         resultFlags and 0x20 != 0 -> "Split time above allowed range"
@@ -83,14 +91,14 @@ data class TestResult(
     fun splitTimeText(): String {
         val value = effectiveSplitNs
         if (value == 0L) return "not recorded"
-        val magnitude = kotlin.math.abs(value)
-        val sign = if (value < 0) "-" else ""
-        return when {
-            magnitude < 1_000L -> "$sign${magnitude}ns"
-            magnitude < 1_000_000L -> sign + formatWholeish(magnitude / 1_000.0, "us")
-            magnitude < 1_000_000_000L -> sign + formatWholeish(magnitude / 1_000_000.0, "ms")
-            else -> sign + formatWholeish(magnitude / 1_000_000_000.0, "s")
+        val magnitude = abs(value)
+        val formatted = when {
+            magnitude < 1_000L -> "${magnitude}ns"
+            magnitude < 1_000_000L -> formatWholeish(magnitude / 1_000.0, "us")
+            magnitude < 1_000_000_000L -> formatWholeish(magnitude / 1_000_000.0, "ms")
+            else -> formatWholeish(magnitude / 1_000_000_000.0, "s")
         }
+        return "${if (value < 0) "-" else ""}$formatted$reversedMarker"
     }
 
     fun waveformEvents(): List<WaveformEvent> = WaveformCodec.decode(traceData)
@@ -137,7 +145,77 @@ enum class DistanceUnit(val label: String, val toMeters: Double) {
     FEET("ft", 0.3048),
 }
 
-/** Dead-simple JSON file persistence — no database needed for a results log. */
+/** Parse both current public shot files and older private-cache records. */
+internal fun testResultFromJson(
+    o: JSONObject,
+    folder: String = "",
+    folderLabel: String = "",
+): TestResult {
+    val legacyOutcome = o.optString("outcome", "")
+    val sourceIsManual = o.optString("source", "") == "manual"
+    val fallbackUid = UUID.nameUUIDFromBytes(
+        (folder.ifBlank { o.toString() }).toByteArray()
+    ).toString()
+    return TestResult(
+        uid = o.optString("uid", fallbackUid).ifBlank { fallbackUid },
+        deviceResultId = o.optInt("deviceResultId", if (sourceIsManual) -1 else 0),
+        splitNs = o.optLong("splitNs", 0),
+        distanceM = o.optDouble("distanceM", 0.0).takeIf { it.isFinite() } ?: 0.0,
+        label = folderLabel.ifBlank { o.optString("label", "") },
+        epochMillis = o.optLong("epochMillis", -1L).takeIf { it > 0 },
+        tool = o.optString("tool", o.optString("disruptorTypeModel", "")),
+        shotType = o.optString("shotType", "Standard").ifBlank { "Standard" },
+        disruptorLoading = o.optString("disruptorLoading", ""),
+        projectileType = o.optString("projectileType", "Water").ifBlank { "Water" },
+        targetDistValue = o.optDouble("targetDistValue").takeIf { !it.isNaN() }
+            ?: legacyDistValue(o.optString("targetDistance", "")),
+        targetDistUnit = o.optString("targetDistUnit").ifBlank {
+            legacyDistUnit(o.optString("targetDistance", ""))
+        },
+        target = o.optString("target", ""),
+        passFail = o.optString("passFail", ""),
+        specialNotes = o.optString("specialNotes", legacyOutcome),
+        outcome = legacyOutcome,
+        manualVelocityMps = o.optDouble("manualVelocityMps").takeIf { !it.isNaN() }
+            ?: o.optDouble("velocityMps").takeIf { sourceIsManual && !it.isNaN() },
+        deviceSerial = o.optString("deviceSerial", ""),
+        resultFlags = o.optInt("resultFlags", 0),
+        rawStartTicks = o.optLong("rawStartTicks", 0),
+        rawStopTicks = o.optLong("rawStopTicks", 0),
+        batteryMv = o.optInt("batteryMv", -1).takeIf { it >= 0 },
+        portFlags = o.optInt("portFlags", 0),
+        bootId = o.optLong("bootId", 0),
+        resetCause = o.optLong("resetCause", 0),
+        hardwareRevision = o.optInt("hardwareRevision", 0),
+        firmwareVersion = o.optString("firmwareVersion", ""),
+        formatVersion = o.optInt("formatVersion", 1),
+        crcValid = o.optBoolean("crcValid", true),
+        traceFormatVersion = o.optInt("traceFormatVersion", 0),
+        traceBaseTicks = o.optLong("traceBaseTicks", 0),
+        traceFlags = o.optInt("traceFlags", 0),
+        traceData = o.optString("traceData", ""),
+        reviewedSplitNs = o.optLong("reviewedSplitNs", Long.MIN_VALUE)
+            .takeUnless { it == Long.MIN_VALUE },
+        reviewedStartOffsetTicks = o.optLong(
+            "reviewedStartOffsetTicks",
+            Long.MIN_VALUE,
+        ).takeUnless { it == Long.MIN_VALUE },
+        reviewedStopOffsetTicks = o.optLong(
+            "reviewedStopOffsetTicks",
+            Long.MIN_VALUE,
+        ).takeUnless { it == Long.MIN_VALUE },
+        reviewedAtMillis = o.optLong("reviewedAtMillis", -1L).takeIf { it > 0 },
+        measurementErrorM = o.optDouble(
+            "measurementErrorM",
+            o.optDouble("distanceUncertaintyM", 0.0005),
+        ).takeIf { it.isFinite() && it >= 0.0 } ?: 0.0005,
+        measurementErrorUnit = o.optString("measurementErrorUnit", "INCHES"),
+        shotFolder = folder.ifBlank { o.optString("shotFolder", "") },
+        thumbnailUri = o.optString("thumbnailUri", ""),
+    )
+}
+
+/** Private recovery cache; public project folders are the displayed source. */
 class ResultStore(context: Context, simulation: Boolean = false) {
     // Simulated runs persist to their own file so demo data never mixes with
     // real results.
@@ -148,58 +226,7 @@ class ResultStore(context: Context, simulation: Boolean = false) {
         return runCatching {
             val arr = JSONArray(file.readText())
             (0 until arr.length()).map { i ->
-                val o = arr.getJSONObject(i)
-                val legacyOutcome = o.optString("outcome", "")
-                TestResult(
-                    uid = o.getString("uid"),
-                    deviceResultId = o.getInt("deviceResultId"),
-                    splitNs = o.getLong("splitNs"),
-                    distanceM = o.getDouble("distanceM"),
-                    label = o.optString("label", ""),
-                    epochMillis = o.optLong("epochMillis", -1L).takeIf { it > 0 },
-                    tool = o.optString("tool", ""),
-                    shotType = o.optString("shotType", "Standard").ifBlank { "Standard" },
-                    disruptorLoading = o.optString("disruptorLoading", ""),
-                    projectileType = o.optString("projectileType", "Water").ifBlank { "Water" },
-                    targetDistValue = o.optDouble("targetDistValue").takeIf { !it.isNaN() }
-                        ?: legacyDistValue(o.optString("targetDistance", "")),
-                    targetDistUnit = o.optString("targetDistUnit").ifBlank {
-                        legacyDistUnit(o.optString("targetDistance", ""))
-                    },
-                    target = o.optString("target", ""),
-                    passFail = o.optString("passFail", ""),
-                    specialNotes = o.optString("specialNotes", legacyOutcome),
-                    outcome = legacyOutcome,
-                    manualVelocityMps = o.optDouble("manualVelocityMps").takeIf { !it.isNaN() },
-                    deviceSerial = o.optString("deviceSerial", ""),
-                    resultFlags = o.optInt("resultFlags", 0),
-                    rawStartTicks = o.optLong("rawStartTicks", 0),
-                    rawStopTicks = o.optLong("rawStopTicks", 0),
-                    batteryMv = o.optInt("batteryMv", -1).takeIf { it >= 0 },
-                    portFlags = o.optInt("portFlags", 0),
-                    bootId = o.optLong("bootId", 0),
-                    resetCause = o.optLong("resetCause", 0),
-                    hardwareRevision = o.optInt("hardwareRevision", 0),
-                    firmwareVersion = o.optString("firmwareVersion", ""),
-                    formatVersion = o.optInt("formatVersion", 1),
-                    crcValid = o.optBoolean("crcValid", true),
-                    traceFormatVersion = o.optInt("traceFormatVersion", 0),
-                    traceBaseTicks = o.optLong("traceBaseTicks", 0),
-                    traceFlags = o.optInt("traceFlags", 0),
-                    traceData = o.optString("traceData", ""),
-                    reviewedSplitNs = o.optLong("reviewedSplitNs", Long.MIN_VALUE)
-                        .takeUnless { it == Long.MIN_VALUE },
-                    reviewedStartOffsetTicks =
-                        o.optLong("reviewedStartOffsetTicks", Long.MIN_VALUE)
-                            .takeUnless { it == Long.MIN_VALUE },
-                    reviewedStopOffsetTicks =
-                        o.optLong("reviewedStopOffsetTicks", Long.MIN_VALUE)
-                            .takeUnless { it == Long.MIN_VALUE },
-                    reviewedAtMillis = o.optLong("reviewedAtMillis", -1L)
-                        .takeIf { it > 0 },
-                    shotFolder = o.optString("shotFolder", ""),
-                    thumbnailUri = o.optString("thumbnailUri", ""),
-                )
+                testResultFromJson(arr.getJSONObject(i))
             }
         }.getOrDefault(emptyList())
     }
@@ -239,6 +266,8 @@ class ResultStore(context: Context, simulation: Boolean = false) {
                     .put("traceBaseTicks", r.traceBaseTicks)
                     .put("traceFlags", r.traceFlags)
                     .put("traceData", r.traceData)
+                    .put("measurementErrorM", r.measurementErrorM)
+                    .put("measurementErrorUnit", r.measurementErrorUnit)
                     .put("shotFolder", r.shotFolder)
                     .put("thumbnailUri", r.thumbnailUri)
                     .apply {

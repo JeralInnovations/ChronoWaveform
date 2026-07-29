@@ -72,6 +72,8 @@ const uint8_t SENSOR2_PIN = 1;   // D1 - STOP
 const uint8_t CHARGE1_PIN = 2;   // D2 -> 10k 1% -> sensor-1 node (calibration)
 const uint8_t CHARGE2_PIN = 3;   // D3 -> 10k 1% -> sensor-2 node (calibration)
 const uint8_t WAKE_BUTTON_PIN = 4;
+const uint32_t POWER_LONG_PRESS_MS = 1500UL;
+const uint32_t BUTTON_DEBOUNCE_MS = 30UL;
 
 #if CHRONO_BOARD_PROFILE == CHRONO_BOARD_XIAO
 const uint8_t HW_REV = 2;        // economical XIAO two-channel PTH board
@@ -100,12 +102,10 @@ uint32_t GPIOTE_MASK_S1 = 1UL << 0;
 uint32_t GPIOTE_MASK_S2 = 1UL << 1;
 const uint8_t PPI_S1     = 0;
 const uint8_t PPI_S2     = 1;
-const uint8_t PPI_START_ENABLES_STOP = 2;
-const uint8_t PPI_TRACE_S1 = 3;
-const uint8_t PPI_TRACE_S2 = 4;
+const uint8_t PPI_TRACE_S1 = 2;
+const uint8_t PPI_TRACE_S2 = 3;
 const uint8_t PPI_GRP_S1 = 0;
 const uint8_t PPI_GRP_S2 = 1;
-const uint8_t PPI_GRP_START = 2;
 const uint32_t TIMER_HZ = 16000000UL;   // TIMER2 @ 16 MHz, PRESCALER 0
 const uint16_t MAX_TRACE_EVENTS = 256;
 const uint32_t TRACE_CAPTURE_MS = 250UL;
@@ -245,7 +245,7 @@ struct __attribute__((packed)) CalResult {
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
 const uint8_t FW_MAJOR = 3;
-const uint8_t FW_MINOR = 0;
+const uint8_t FW_MINOR = 1;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -282,7 +282,7 @@ struct __attribute__((packed)) StatusPacket {
   uint8_t  timeValid;
   uint8_t  batteryPercent;
   uint16_t batteryMv;
-  uint8_t  batteryArmLocked;
+  uint8_t  legacyBatteryLock; // retained for packet compatibility; always 0
 };
 
 struct __attribute__((packed)) HwInfo {
@@ -312,6 +312,8 @@ bool     hfxoOn         = false;
 volatile uint8_t calRequested = 0;   // 1 or 2; handled in loop()
 volatile uint8_t healthRequested = 0; // 1 normal, 2 logged override arm
 uint32_t identifyUntilMs = 0;
+bool powerButtonHolding = false;
+uint32_t powerButtonPressedAtMs = 0;
 uint32_t startedAtMs = 0;
 uint32_t traceStartedAtMs = 0;
 uint8_t activeResultFlags = 0;
@@ -328,12 +330,12 @@ uint32_t resetCause = 0;
 
 const uint32_t MIN_SENSOR_SIGNATURE_NS = 20000UL;
 const uint32_t MAX_SENSOR_SIGNATURE_NS = 5000000UL;
-const uint32_t MAX_STABLE_STDDEV_NS = 5000UL;
+const uint32_t MAX_STABLE_STDDEV_NS = 10000UL;
+const uint8_t MIN_USABLE_HEALTH_SAMPLES = 48;
+const uint8_t MIN_STABLE_HEALTH_SAMPLES = 60;
 const uint32_t MIN_SPLIT_NS = 10000UL;
 const uint32_t MAX_SPLIT_NS = 1000000000UL;
 const uint32_t STOP_TIMEOUT_MS = 1000UL;
-const uint16_t BATTERY_ARM_LOCK_MV = 3400;
-const uint16_t BATTERY_ARM_RELEASE_MV = 3500;
 
 // ACK ids are queued here from the BLE callback and applied in loop(), so
 // the pending[] buffer is only ever mutated from one context.
@@ -451,19 +453,8 @@ void setupTiming() {
   NRF_PPI->CH[PPI_TRACE_S1].TEP = (uint32_t)&NRF_TIMER2->TASKS_CAPTURE[2];
   NRF_PPI->CH[PPI_TRACE_S2].EEP = (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_S2];
   NRF_PPI->CH[PPI_TRACE_S2].TEP = (uint32_t)&NRF_TIMER2->TASKS_CAPTURE[3];
-
-  // START enables the STOP capture group in hardware. STOP is therefore not
-  // timestampable before START, without relying on firmware reaction time.
-  NRF_PPI->CH[PPI_START_ENABLES_STOP].EEP =
-      (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_S1];
-  NRF_PPI->CH[PPI_START_ENABLES_STOP].TEP =
-      (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_S2].EN;
-  NRF_PPI->FORK[PPI_START_ENABLES_STOP].TEP =
-      (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_START].DIS;
-
   NRF_PPI->CHG[PPI_GRP_S1] = (1UL << PPI_S1);
   NRF_PPI->CHG[PPI_GRP_S2] = (1UL << PPI_S2);
-  NRF_PPI->CHG[PPI_GRP_START] = (1UL << PPI_START_ENABLES_STOP);
 }
 
 bool requestHfxo() {
@@ -481,7 +472,7 @@ void releaseHfxo() {
   if (hfxoOn) { sd_clock_hfclk_release(); hfxoOn = false; }
 }
 
-// Prepare the capture hardware with START enabled and STOP hardware-gated.
+// Arm both first-edge captures so reversed travel keeps hardware resolution.
 bool armTiming() {
   if (!requestHfxo()) return false;
   NRF_GPIOTE->INTENCLR = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
@@ -501,11 +492,9 @@ bool armTiming() {
   stopActivityBeforeStart = false;
   traceStartedAtMs = 0;
   traceRecording = true;
-  NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS = 1;
-  NRF_PPI->TASKS_CHG[PPI_GRP_START].DIS = 1;
   NRF_PPI->CHENSET = (1UL << PPI_TRACE_S1) | (1UL << PPI_TRACE_S2);
   NRF_PPI->TASKS_CHG[PPI_GRP_S1].EN = 1;
-  NRF_PPI->TASKS_CHG[PPI_GRP_START].EN = 1;
+  NRF_PPI->TASKS_CHG[PPI_GRP_S2].EN = 1;
   NRF_GPIOTE->INTENSET = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
   return true;
 }
@@ -515,7 +504,6 @@ void disarmTiming() {
   NRF_GPIOTE->INTENCLR = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
   NRF_PPI->TASKS_CHG[PPI_GRP_S1].DIS = 1;
   NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS = 1;
-  NRF_PPI->TASKS_CHG[PPI_GRP_START].DIS = 1;
   NRF_PPI->CHENCLR = (1UL << PPI_TRACE_S1) | (1UL << PPI_TRACE_S2);
   releaseHfxo();
 }
@@ -677,17 +665,52 @@ uint16_t readBatteryMv() {
   return (uint16_t)mv;
 #else
   // The XIAO battery pads feed its 1S LiPo charger and a 2.961:1 monitor
-  // divider. LOW enables the divider; keeping it LOW also avoids exposing
-  // P0.31 to the un-divided battery rail while USB charging is present.
+  // divider (1M/510k). LOW enables the divider; keeping it LOW also avoids
+  // exposing P0.31 to the un-divided battery rail while USB charging.
+  //
+  // IMPORTANT: the divider's ~340k source impedance is far above what the
+  // core's analogRead() 3 us acquisition window can charge, so it under-reads
+  // by 10-20%. Read the channel directly with a 40 us acquisition
+  // window and 8x hardware burst oversampling instead. (PIN_VBAT = P0.31 =
+  // SAADC AIN7; gain 1/6 against the 0.6 V internal reference gives the same
+  // 3.6 V full scale the old math assumed.)
   pinMode(PIN_VBAT_ENABLE, OUTPUT);
   digitalWrite(PIN_VBAT_ENABLE, LOW);
   pinMode(PIN_VBAT, INPUT);
-  analogReference(AR_DEFAULT);  // nRF52 ADC full scale: 3.6 V
-  analogReadResolution(12);
-  delay(10);                    // allow the divider and ADC input to settle
-  uint32_t raw = analogRead(PIN_VBAT);
+  delay(2);                     // divider settle after enable
+
+  NRF_SAADC->RESOLUTION = SAADC_RESOLUTION_VAL_12bit;
+  NRF_SAADC->OVERSAMPLE = SAADC_OVERSAMPLE_OVERSAMPLE_Over8x;
+  NRF_SAADC->CH[0].PSELP = SAADC_CH_PSELP_PSELP_AnalogInput7;
+  NRF_SAADC->CH[0].PSELN = SAADC_CH_PSELN_PSELN_NC;
+  NRF_SAADC->CH[0].CONFIG =
+      (SAADC_CH_CONFIG_RESP_Bypass     << SAADC_CH_CONFIG_RESP_Pos) |
+      (SAADC_CH_CONFIG_RESN_Bypass     << SAADC_CH_CONFIG_RESN_Pos) |
+      (SAADC_CH_CONFIG_GAIN_Gain1_6    << SAADC_CH_CONFIG_GAIN_Pos) |
+      (SAADC_CH_CONFIG_REFSEL_Internal << SAADC_CH_CONFIG_REFSEL_Pos) |
+      (SAADC_CH_CONFIG_TACQ_40us       << SAADC_CH_CONFIG_TACQ_Pos) |
+      (SAADC_CH_CONFIG_MODE_SE         << SAADC_CH_CONFIG_MODE_Pos) |
+      (SAADC_CH_CONFIG_BURST_Enabled   << SAADC_CH_CONFIG_BURST_Pos);
+
+  volatile int16_t sample = 0;
+  NRF_SAADC->RESULT.PTR = (uint32_t)&sample;
+  NRF_SAADC->RESULT.MAXCNT = 1;
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Enabled;
+  NRF_SAADC->EVENTS_STARTED = 0;
+  NRF_SAADC->TASKS_START = 1;
+  while (!NRF_SAADC->EVENTS_STARTED) {}
+  NRF_SAADC->EVENTS_END = 0;
+  NRF_SAADC->TASKS_SAMPLE = 1;          // burst: 8 conversions, averaged in HW
+  while (!NRF_SAADC->EVENTS_END) {}
+  NRF_SAADC->EVENTS_STOPPED = 0;
+  NRF_SAADC->TASKS_STOP = 1;
+  while (!NRF_SAADC->EVENTS_STOPPED) {}
+  NRF_SAADC->ENABLE = SAADC_ENABLE_ENABLE_Disabled;
+
+  int32_t raw = sample;
+  if (raw < 0) raw = 0;
   // 2.961 divider ratio * 3.6 V ADC range, converted to millivolts.
-  uint32_t mv = (raw * 10660UL + 2048UL) / 4096UL;
+  uint32_t mv = ((uint32_t)raw * 10660UL + 2048UL) / 4096UL;
   return (uint16_t)mv;
 #endif
 }
@@ -703,15 +726,6 @@ uint16_t sampleBatteryMv() {
   if (filteredBatteryMv == 0) filteredBatteryMv = raw;
   else filteredBatteryMv = (uint16_t)(((uint32_t)filteredBatteryMv * 7UL + raw + 4UL) / 8UL);
   return filteredBatteryMv;
-}
-
-bool refreshBatteryArmLock(uint16_t mv) {
-  if (batteryArmLocked) {
-    if (mv >= BATTERY_ARM_RELEASE_MV) batteryArmLocked = false;
-  } else if (mv <= BATTERY_ARM_LOCK_MV) {
-    batteryArmLocked = true;
-  }
-  return batteryArmLocked;
 }
 
 uint16_t crc16Ccitt(const uint8_t* data, size_t len) {
@@ -742,10 +756,16 @@ uint32_t makeBootId() {
 uint16_t classifyPort(const CalResult& r, bool crossCoupled, bool initiallyHigh) {
   uint16_t flags = 0;
   if (initiallyHigh) flags |= PORT_STUCK_HIGH;
-  if (r.status != 0 || r.samples < CAL_SAMPLES || r.medianNs > MAX_SENSOR_SIGNATURE_NS)
+  if (r.status == 2 || r.samples < MIN_USABLE_HEALTH_SAMPLES ||
+      r.medianNs > MAX_SENSOR_SIGNATURE_NS)
     flags |= PORT_LEAK_OR_SHORT;
-  if (r.samples && (r.stddevNs > MAX_STABLE_STDDEV_NS ||
-      (r.medianNs && r.stddevNs > r.medianNs / 20UL))) flags |= PORT_UNSTABLE;
+  // Cheap piezo/cable assemblies are usable with modest RC variation. Warn
+  // only when variation exceeds both a 10 us floor and 10% of the median, or
+  // when several of the 64 sweeps time out. One marginal sweep must not make
+  // a channel alternate between Ready and Unstable on successive checks.
+  if (r.samples && (r.samples < MIN_STABLE_HEALTH_SAMPLES ||
+      (r.stddevNs > MAX_STABLE_STDDEV_NS &&
+       r.medianNs && r.stddevNs > r.medianNs / 10UL))) flags |= PORT_UNSTABLE;
   if (crossCoupled) flags |= PORT_CROSS_COUPLED;
   if (r.samples && r.medianNs < MIN_SENSOR_SIGNATURE_NS) flags |= PORT_MISSING_SENSOR;
   return flags;
@@ -778,14 +798,13 @@ bool performHealthCheck() {
 
 void notifyStatus() {
   uint16_t batteryMv = sampleBatteryMv();
-  refreshBatteryArmLock(batteryMv);
   StatusPacket pkt = {
     state,
     pendingCount,
     (uint8_t)(timeValid ? 1 : 0),
     batteryPercentFromMv(batteryMv),
     batteryMv,
-    (uint8_t)(batteryArmLocked ? 1 : 0)
+    0  // legacy battery-lock byte; voltage is warning-only in firmware 2.2+
   };
   chStatus.write((uint8_t*)&pkt, sizeof(pkt));
   chStatus.notify((uint8_t*)&pkt, sizeof(pkt));
@@ -900,15 +919,30 @@ void finishTimingFault(uint8_t faultFlag) {
   setState(ST_FAULT);
 }
 
+void finishCapturedPair() {
+  uint32_t startTicks = NRF_TIMER2->CC[0];
+  uint32_t stopTicks = NRF_TIMER2->CC[1];
+  int32_t signedTicks = (int32_t)(stopTicks - startTicks);
+  bool reversed = signedTicks < 0;
+  uint32_t ticks = reversed
+      ? (uint32_t)(-(int64_t)signedTicks)
+      : (uint32_t)signedTicks;
+  uint32_t splitNs = (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIMER_HZ);
+  uint8_t flags = activeResultFlags;
+  if (reversed) flags |= RESULT_STOP_BEFORE_START;
+  if (splitNs < MIN_SPLIT_NS) flags |= RESULT_SPLIT_TOO_SHORT;
+  if (splitNs > MAX_SPLIT_NS) flags |= RESULT_SPLIT_TOO_LONG;
+  armed = false;
+  started = false;
+  finished = false;
+  disarmTiming();
+  storeResult(splitNs, flags, startTicks, stopTicks);
+  setState((flags & (RESULT_STOP_BEFORE_START |
+                     RESULT_SPLIT_TOO_SHORT |
+                     RESULT_SPLIT_TOO_LONG)) ? ST_FAULT : ST_IDLE);
+}
+
 void beginArm(bool overrideFaults) {
-  uint16_t batteryMv = sampleBatteryMv();
-  if (refreshBatteryArmLock(batteryMv)) {
-    armed = false;
-    started = false;
-    finished = false;
-    setState(ST_FAULT);
-    return;
-  }
   bool healthy = performHealthCheck();
   activeResultFlags = overrideFaults ? RESULT_ARM_OVERRIDE : 0;
   if (!healthy) activeResultFlags |= RESULT_PORT_WARNING;
@@ -941,6 +975,109 @@ void setState(uint8_t s) {
   notifyStatus();
 }
 
+void waitForButtonRelease() {
+  uint32_t releasedAtMs = 0;
+  while (true) {
+    if (digitalRead(WAKE_BUTTON_PIN) == HIGH) {
+      if (releasedAtMs == 0) releasedAtMs = millis();
+      if ((uint32_t)(millis() - releasedAtMs) >= BUTTON_DEBOUNCE_MS) return;
+    } else {
+      releasedAtMs = 0;
+    }
+    delay(1);
+  }
+}
+
+void enterSystemOff() {
+  statusLedWrite(false);
+  nrf_gpio_cfg_default(g_ADigitalPinMap[SENSOR1_PIN]);
+  nrf_gpio_cfg_default(g_ADigitalPinMap[SENSOR2_PIN]);
+  nrf_gpio_cfg_default(g_ADigitalPinMap[CHARGE1_PIN]);
+  nrf_gpio_cfg_default(g_ADigitalPinMap[CHARGE2_PIN]);
+  systemOff(WAKE_BUTTON_PIN, LOW);  // D4 pull-up, wake when the button pulls low
+  while (true) delay(1000);         // systemOff() does not normally return
+}
+
+void showPowerOnPattern() {
+  for (uint8_t i = 0; i < 3; i++) {
+    statusLedWrite(true);
+    delay(90);
+    statusLedWrite(false);
+    delay(90);
+  }
+}
+
+void showPowerOffPattern() {
+  for (uint8_t i = 0; i < 2; i++) {
+    statusLedWrite(true);
+    delay(240);
+    statusLedWrite(false);
+    delay(180);
+  }
+}
+
+void requireLongPressAfterSystemOffWake(uint32_t startupResetCause) {
+  if ((startupResetCause & POWER_RESETREAS_OFF_Msk) == 0) {
+    showPowerOnPattern();
+    return;
+  }
+
+  delay(BUTTON_DEBOUNCE_MS);
+  if (digitalRead(WAKE_BUTTON_PIN) != LOW) enterSystemOff();
+
+  uint32_t pressedAtMs = millis();
+  while ((uint32_t)(millis() - pressedAtMs) < POWER_LONG_PRESS_MS) {
+    if (digitalRead(WAKE_BUTTON_PIN) != LOW) {
+      waitForButtonRelease();
+      enterSystemOff();
+    }
+    statusLedWrite(((millis() - pressedAtMs) / 180UL & 1UL) == 0UL);
+    delay(2);
+  }
+
+  statusLedWrite(true);             // hold accepted
+  waitForButtonRelease();
+  showPowerOnPattern();
+}
+
+void powerOffFromButton() {
+  healthRequested = 0;
+  calRequested = 0;
+  fetchRequested = false;
+  armed = false;
+  started = false;
+  finished = false;
+  disarmTiming();
+  state = ST_IDLE;
+  showPowerOffPattern();
+  waitForButtonRelease();
+  enterSystemOff();
+}
+
+void pollUserButton() {
+  static bool rawDown = false;
+  static bool stableDown = false;
+  static uint32_t rawChangedAtMs = 0;
+
+  bool down = digitalRead(WAKE_BUTTON_PIN) == LOW;
+  if (down != rawDown) {
+    rawDown = down;
+    rawChangedAtMs = millis();
+  }
+  if (down == stableDown) {
+    if (stableDown &&
+        (uint32_t)(millis() - powerButtonPressedAtMs) >= POWER_LONG_PRESS_MS) {
+      powerOffFromButton();
+    }
+    return;
+  }
+  if ((uint32_t)(millis() - rawChangedAtMs) < BUTTON_DEBOUNCE_MS) return;
+
+  stableDown = down;
+  powerButtonHolding = stableDown;
+  if (stableDown) powerButtonPressedAtMs = millis();
+}
+
 // --------------------------------------------------------- BLE callbacks
 void onControlWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, uint16_t len) {
   (void)conn_hdl; (void)chr;
@@ -958,6 +1095,8 @@ void onControlWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, ui
       break;
     case CMD_DISARM:
     case CMD_CANCEL:
+      healthRequested = 0;
+      calRequested = 0;
       armed    = false;
       started  = false;
       finished = false;
@@ -1022,8 +1161,10 @@ void onDisconnect(uint16_t conn_hdl, uint8_t reason) {
 void setup() {
   statusLedBegin();
   pinMode(WAKE_BUTTON_PIN, INPUT_PULLUP);
+  uint32_t startupResetCause = NRF_POWER->RESETREAS;
+  requireLongPressAfterSystemOffWake(startupResetCause);
   bootId = makeBootId();
-  resetCause = NRF_POWER->RESETREAS;
+  resetCause = startupResetCause;
   NRF_POWER->RESETREAS = resetCause;
 
   Bluefruit.begin();
@@ -1106,6 +1247,8 @@ void setup() {
 
 // ------------------------------------------------------------------- loop
 void loop() {
+  pollUserButton();
+
   switch (state) {
     case ST_VERIFY1:
       if (digitalRead(SENSOR1_PIN) == HIGH) setState(ST_VERIFY1_OK);
@@ -1119,37 +1262,27 @@ void loop() {
     case ST_RUNNING:
       // GPIOTE_IRQHandler clears event registers after copying trace samples,
       // so the preserved first-edge capture registers are the source of truth.
-      if (!started && NRF_TIMER2->CC[0] != 0xFFFFFFFFUL) {
-        started = true;
-        startedAtMs = millis();
-        setState(ST_RUNNING);
-      }
-      if (started && !finished && NRF_TIMER2->CC[1] != 0xFFFFFFFFUL) {
-        finished = true;
-      }
+      {
+        bool haveStart = NRF_TIMER2->CC[0] != 0xFFFFFFFFUL;
+        bool haveStop = NRF_TIMER2->CC[1] != 0xFFFFFFFFUL;
+        if (!started && (haveStart || haveStop)) {
+          started = true;
+          startedAtMs = millis();
+          setState(ST_RUNNING);
+        }
+        if (started && !finished && haveStart && haveStop) {
+          finished = true;
+        }
 
-      // Do not end at the automatic STOP edge. Keep the inputs live long
-      // enough to capture the later impact/ringing that the user may select.
-      if (started && finished &&
-          (uint32_t)(millis() - startedAtMs) >= TRACE_CAPTURE_MS) {
-        uint32_t ticks = NRF_TIMER2->CC[1] - NRF_TIMER2->CC[0];  // wrap-safe
-        uint32_t splitNs = (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIMER_HZ);
-        uint8_t flags = activeResultFlags;
-        if (stopActivityBeforeStart) flags |= RESULT_STOP_BEFORE_START;
-        if (splitNs < MIN_SPLIT_NS) flags |= RESULT_SPLIT_TOO_SHORT;
-        if (splitNs > MAX_SPLIT_NS) flags |= RESULT_SPLIT_TOO_LONG;
-        armed = false;
-        started = false;
-        finished = false;
-        disarmTiming();
-        storeResult(splitNs, flags, NRF_TIMER2->CC[0], NRF_TIMER2->CC[1]);
-        setState((flags & (RESULT_SPLIT_TOO_SHORT | RESULT_SPLIT_TOO_LONG)) ? ST_FAULT : ST_IDLE);
-      } else if (started && !finished &&
-                 (uint32_t)(millis() - startedAtMs) >= STOP_TIMEOUT_MS) {
-        finishTimingFault(RESULT_STOP_TIMEOUT);
-      } else if (!started && stopActivityBeforeStart && traceStartedAtMs &&
-                 (uint32_t)(millis() - traceStartedAtMs) >= STOP_TIMEOUT_MS) {
-        finishTimingFault(RESULT_STOP_BEFORE_START);
+        // Keep both inputs live after the automatic pair so later impact and
+        // ringing transitions are available for user-selected cursors.
+        if (started && finished &&
+            (uint32_t)(millis() - startedAtMs) >= TRACE_CAPTURE_MS) {
+          finishCapturedPair();
+        } else if (started && !finished &&
+                   (uint32_t)(millis() - startedAtMs) >= STOP_TIMEOUT_MS) {
+          finishTimingFault(haveStop ? RESULT_STOP_BEFORE_START : RESULT_STOP_TIMEOUT);
+        }
       }
       break;
 
@@ -1206,16 +1339,20 @@ void loop() {
     notifyStatus();
   }
 
-  // Identify has priority; standby blinks, timing is solid, faults double-blink.
-  if ((int32_t)(identifyUntilMs - millis()) > 0) {
+  // Priority: power hold, Identify, active timing, fault, checking, heartbeat.
+  if (powerButtonHolding) {
+    statusLedWrite((((millis() - powerButtonPressedAtMs) / 180UL) & 1UL) == 0UL);
+  } else if ((int32_t)(identifyUntilMs - millis()) > 0) {
     statusLedWrite(((millis() / 150UL) & 1UL) == 0UL);
-  } else if (state == ST_ARMED) {
-    statusLedWrite(((millis() / 1000UL) % 2UL) == 0UL);
+  } else if (state == ST_ARMED || state == ST_RUNNING) {
+    statusLedWrite(((millis() / 120UL) & 1UL) == 0UL);
   } else if (state == ST_FAULT) {
     uint32_t phase = millis() % 1200UL;
     statusLedWrite(phase < 120UL || (phase >= 240UL && phase < 360UL));
+  } else if (state == ST_CHECKING) {
+    statusLedWrite(true);
   } else {
-    statusLedWrite(state == ST_RUNNING || state == ST_CHECKING);
+    statusLedWrite((millis() % 2000UL) < 60UL);
   }
 
   delay(2);

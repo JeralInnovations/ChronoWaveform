@@ -103,6 +103,7 @@ fun WaveformPreview(
 @Composable
 fun WaveformReviewDialog(
     result: TestResult,
+    accuracyEnvelopePercentForSplit: (Long) -> Double,
     onDismiss: () -> Unit,
     onApply: (startOffsetTicks: Long, stopOffsetTicks: Long) -> Unit,
     onReset: () -> Unit,
@@ -262,7 +263,14 @@ fun WaveformReviewDialog(
                         },
                     )
 
-                    MeasurementCard(result, startTick, stopTick)
+                    MeasurementCard(
+                        result = result,
+                        startTick = startTick,
+                        stopTick = stopTick,
+                        accuracyEnvelopePercent = accuracyEnvelopePercentForSplit(
+                            ticksToNanoseconds(stopTick - startTick),
+                        ),
+                    )
                     TraceWarnings(result.traceFlags)
                 }
 
@@ -324,7 +332,12 @@ private fun CursorControls(
 }
 
 @Composable
-private fun MeasurementCard(result: TestResult, startTick: Long, stopTick: Long) {
+private fun MeasurementCard(
+    result: TestResult,
+    startTick: Long,
+    stopTick: Long,
+    accuracyEnvelopePercent: Double,
+) {
     val deltaNs = ticksToNanoseconds(stopTick - startTick)
     val velocityMps = if (deltaNs != 0L && result.distanceM > 0) {
         result.distanceM / (deltaNs / 1_000_000_000.0)
@@ -352,6 +365,16 @@ private fun MeasurementCard(result: TestResult, startTick: Long, stopTick: Long)
                 else "Velocity  %.2f m/s  ·  %.1f ft/s".format(velocityMps, velocityMps * 3.28084),
                 style = MaterialTheme.typography.titleMedium,
             )
+            if (velocityMps != 0.0) {
+                val velocityErrorFps =
+                    kotlin.math.abs(velocityMps * 3.28084) * accuracyEnvelopePercent / 100.0
+                Text(
+                    "Estimated error  +/- %.1f%% GAE  (+/- %.1f ft/s)"
+                        .format(accuracyEnvelopePercent, velocityErrorFps),
+                    color = Teal,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
             val autoDifference = deltaNs - result.splitNs
             Text(
                 "Automatic ${formatTraceTime(result.splitNs)}  ·  change ${formatSignedTime(autoDifference)}",

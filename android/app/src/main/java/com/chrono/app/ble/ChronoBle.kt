@@ -88,10 +88,9 @@ data class DeviceStatus(
     val timeValid: Boolean,
     val batteryPercent: Int? = null,
     val batteryMv: Int? = null,
-    val batteryLocked: Boolean = false,
 ) {
     val lowBattery: Boolean
-        get() = batteryLocked || (batteryPercent != null && batteryPercent <= 15) ||
+        get() = (batteryPercent != null && batteryPercent <= 15) ||
             (batteryMv != null && batteryMv in 1..3499)
 }
 
@@ -138,7 +137,7 @@ data class PortHealth(val flags: Int, val signatureNs: Long) {
         flags and Proto.PORT_CROSS_COUPLED != 0 -> "Cross-channel connection suspected"
         flags and Proto.PORT_LEAK_OR_SHORT != 0 -> "Conductive leakage or short suspected"
         flags and Proto.PORT_MISSING_SENSOR != 0 -> "Sensor not detected"
-        flags and Proto.PORT_UNSTABLE != 0 -> "Unstable sensor signature"
+        flags and Proto.PORT_UNSTABLE != 0 -> "Ready; variable signature"
         else -> "Ready"
     }
 }
@@ -549,11 +548,18 @@ class ChronoBle(private val context: Context) {
     private fun emitSimFaultResult(flag: Int) {
         val epoch = if (simTimeValid) System.currentTimeMillis() / 1000L else 0L
         simPending++
-        val result = RawResult(simNextId++, 0, epoch, flags = flag,
-            startTicks = if (flag == Proto.RESULT_STOP_TIMEOUT) 1000 else 0,
+        val reversed = flag == Proto.RESULT_STOP_BEFORE_START
+        val split = if (reversed) 25_000_000L else 0L
+        val result = RawResult(simNextId++, split, epoch, flags = flag,
+            startTicks = if (reversed) 401_000 else if (flag == Proto.RESULT_STOP_TIMEOUT) 1000 else 0,
+            stopTicks = if (reversed) 1000 else 0,
             batteryMv = 3990, bootId = 0x53494D31, hwRev = 2, fwMajor = 3,
             formatVersion = 2)
-        simTraces[result.id] = simulatedTrace(result.id, 180_000L)
+        simTraces[result.id] = simulatedTrace(
+            result.id,
+            if (split > 0) split else 180_000L,
+            reversed,
+        )
         if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
         else simBufferedResults.add(result)
         simState = Proto.ST_FAULT
@@ -568,24 +574,30 @@ class ChronoBle(private val context: Context) {
         pushSimStatus()
     }
 
-    private fun simulatedTrace(resultId: Int, splitNs: Long): RawTrace {
+    private fun simulatedTrace(
+        resultId: Int,
+        splitNs: Long,
+        reversed: Boolean = false,
+    ): RawTrace {
         val splitTicks = (splitNs * 16_000_000L / 1_000_000_000L).coerceAtLeast(2)
         val impact1 = 12_000L
         val impact2 = impact1 + splitTicks
+        val firstChannel = if (reversed) 1 else 0
+        val secondChannel = if (reversed) 0 else 1
         val events = mutableListOf(
-            TraceEdge(0, 0, true),
-            TraceEdge(180, 0, false),
-            TraceEdge(splitTicks, 1, true),
-            TraceEdge(splitTicks + 170, 1, false),
+            TraceEdge(0, firstChannel, true),
+            TraceEdge(180, firstChannel, false),
+            TraceEdge(splitTicks, secondChannel, true),
+            TraceEdge(splitTicks + 170, secondChannel, false),
         )
         repeat(10) { index ->
-            events += TraceEdge(impact1 + index * 260L, 0, index % 2 == 0)
-            events += TraceEdge(impact2 + index * 260L, 1, index % 2 == 0)
+            events += TraceEdge(impact1 + index * 260L, firstChannel, index % 2 == 0)
+            events += TraceEdge(impact2 + index * 260L, secondChannel, index % 2 == 0)
         }
         return RawTrace(
             resultId = resultId,
             formatVersion = 1,
-            flags = 0,
+            flags = if (reversed) 4 else 0,
             baseTicks = 1_000,
             events = events.sortedBy { it.offsetTicks },
         )
@@ -812,7 +824,6 @@ class ChronoBle(private val context: Context) {
                     timeValid = v[2].toInt() != 0,
                     batteryPercent = batteryPercent,
                     batteryMv = batteryMv,
-                    batteryLocked = v.size >= 7 && v[6].toInt() != 0,
                 )
             }
             Proto.RESULT -> if (v.size >= 11) {

@@ -14,7 +14,7 @@ Chrono Logger PCB. It supersedes the earlier low-capacitance TVS, BAT54S, and
 | STOP timing input | D1 |
 | START charge/test | D2 through 10k 1% |
 | STOP charge/test | D3 through 10k 1% |
-| Wake/user button | D4 to GND; firmware pull-up |
+| Power button | D4 to GND; firmware pull-up; hold 1.5 seconds for System OFF or wake; short presses do nothing |
 | External status LED | D5 through 330 ohms |
 | Reserved UART | D6/D7 |
 | Available/remappable I2C | D8/D9 |
@@ -22,7 +22,10 @@ Chrono Logger PCB. It supersedes the earlier low-capacitance TVS, BAT54S, and
 | Input stage | Direct protected GPIO, two channels |
 
 The external LED is assumed active-high: `D5 -> 330 ohm -> LED anode`, with
-the LED cathode connected to GND.
+the LED cathode connected to GND. A short pulse every 2 seconds is the powered
+heartbeat. A rapid repeating blink means the logger is armed or actively
+timing; solid means a port check is running, and a double blink indicates a
+fault.
 
 ## Final PTH Input Network
 
@@ -66,11 +69,17 @@ These are electrical observations. In particular, firmware reports
 `conductive leakage or short suspected`; it cannot prove that moisture caused
 the leakage.
 
+Firmware 2.3 treats at least 48 of 64 valid sweeps as electrically usable. It
+reports a non-blocking variable-signature warning when fewer than 60 sweeps
+complete or when standard deviation exceeds both 10 us and 10% of the median.
+This avoids Ready/Unstable flicker from one marginal sweep while preserving a
+warning for genuinely noisy or intermittent wiring.
+
 The XIAO's onboard 1S-LiPo path supplies both charging and pack-voltage
 measurement. Firmware holds `PIN_VBAT_ENABLE` (D14 / P0.14) low, then reads
 `PIN_VBAT` (D32 / P0.31) through the board's approximately 2.961:1 divider.
-It filters the measurement and enforces the same low-battery arm lockout as the
-nice!nano profile. Do not apply an AA pack to `3V3`; that pin is the XIAO
+It filters the measurement for display, warnings, and result records. Low
+voltage never blocks arming. Do not apply an AA pack to `3V3`; that pin is the XIAO
 regulator output. The 3V3 output still supplies the upper piezo steering clamps
 exactly as shown in the input network.
 
@@ -80,32 +89,34 @@ Before every normal arm, firmware checks both ports and refuses to arm if a
 serious fault is present. A deliberately selected override is marked in the
 result flags.
 
-START capture is enabled first. A third PPI channel enables STOP capture from
-the START edge in hardware, so STOP cannot become the accepted timestamp before
-START. Firmware also records and rejects STOP-before-START, STOP timeout, and
-out-of-range split conditions.
+START and STOP first-edge captures are armed together. Each channel latches its
+own hardware timestamp and disables itself against piezo ringing. If STOP is
+captured first, firmware retains the measured magnitude, sets the
+STOP-before-START flag, and the app displays a negative split and velocity with
+an asterisk. A missing second edge still times out, and out-of-range splits
+remain flagged.
 
 The high-frequency crystal must report running before the logger enters the
 armed state. Results include raw START/STOP timer captures, fault flags, logger
 and boot identity, reset cause, revisions, packet format, and CRC.
 
-Battery voltage is filtered in firmware. A new arm is refused at or below
-`3.40 V` and stays refused until the filtered reading reaches `3.50 V`. This
-hysteresis avoids repeatedly toggling the lockout around one voltage. The
-logged diagnostic override does not bypass battery lockout.
+Battery voltage is filtered in firmware and shown as a warning when low. The
+logger still accepts an arm and attempts to capture a shot for as long as its
+supply remains high enough to operate.
 
 ## Feature Boundary
 
 Implemented for this board:
 
 - serial-derived `Chrono-XXXX` BLE names;
-- app nickname, address, RSSI, last-connected marker, and Identify command;
+- app nickname, address, RSSI, last-connected marker, and Flash LED command;
 - firmware-owned pre-arm port health and arm refusal;
 - START-first hardware gating, timeout, range checks, and timing fault logs;
 - per-logger calibration/readiness records with a 30-day age limit;
 - simulation fault selection;
 - diagnostic/result export with device and raw timing metadata;
-- filtered battery reporting, per-result voltage, and critical-battery arm lockout.
+- filtered battery reporting, per-result voltage, and a warning-only low-battery state.
+- low-leakage System OFF with debounced D4 long-press shutdown and wake.
 
 Deferred because this PCB lacks the required hardware or validation:
 
@@ -113,7 +124,6 @@ Deferred because this PCB lacks the required hardware or validation:
 - four timing channels and buffered threshold inputs;
 - BLE bonding or a physical remote-arm confirmation policy;
 - flash-journaled pending results across complete logger power loss.
-- low-leakage storage sleep and D4 system-off wake;
 - Android foreground BLE service and background reconnection;
 - sensor inventory, matched-pair management, saved templates, and series
   statistics/outlier analysis.
@@ -125,8 +135,13 @@ BLE loss but not complete logger power loss.
 
 ## Bring-Up Checks
 
-1. Confirm D4 reads high normally and low while the button is pressed.
-2. Confirm D5 drives the external LED without using the onboard LED mapping.
+1. Confirm D4 reads high normally and low while the button is pressed. Verify a
+   short press has no effect, a 1.5-second hold powers off, and only another
+   complete 1.5-second hold restores normal operation.
+2. Confirm D5 drives the external LED without using the onboard LED mapping:
+   one short heartbeat every 2 seconds while idle, a rapid repeating blink
+   while armed, flashing while the power button is held, three quick power-on
+   flashes, and two slower power-off flashes followed by darkness.
 3. Scope both raw junctions and sense junctions during soft and hard strikes.
 4. Confirm the P4KE15CA and both 1N5711 orientations from the schematic/netlist.
 5. Run empty and loaded RC checks on both channels.
