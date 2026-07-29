@@ -1,17 +1,25 @@
-# Chrono — BLE Chronograph
+# Chrono Waveform — Reviewable BLE Chronograph
 
 A two-sensor chronograph with dedicated builds for the **nice!nano v2** and
 the economical **Seeed Studio XIAO nRF52840 PTH board**, controlled by a native
 **Android app** over Bluetooth Low Energy.
+
+This waveform edition runs on the existing Chrono hardware and records each
+observable high/low transition on both sensor inputs. The Android app renders
+the aligned traces and lets the user place reviewed START and STOP cursors
+instead of having to accept the first edge-to-edge result.
 
 - Sensor 1 (START) pulls input **D0** high → the clock starts
 - Sensor 2 (STOP) pulls input **D1** high → the clock stops
 - The split time is captured by hardware timer logic with 62.5 ns tick resolution
 - Results survive BLE disconnects: the device stores up to 16 un-collected results
   and the app reconnects automatically and downloads them
+- The automatic first-edge result is preserved alongside any reviewed time
+- The app fits both traces to the screen, supports zoom/pan and snap-to-edge
+  cursors, and exports the transition list
 
 ```
-Chrono/
+ChronoWaveform/
 ├── firmware/ChronographNiceNano/           ← flash this to a nice!nano v2
 ├── firmware/ChronographXiao/               ← flash this to the XIAO PTH board
 ├── firmware/Chronograph/                   ← canonical/reference firmware source
@@ -32,6 +40,8 @@ button. The XIAO board reserves D6/D7 for UART and D8/D9 for remappable I2C.
 
 Additional guides:
 
+- `docs/WAVEFORM_REVIEW_EDITION.md` defines trace capture, BLE transport,
+  waveform review, limitations, and validation for this existing-hardware edition.
 - `docs/PORT_FRONT_END_MATH.md` explains the current GPIO piezo front-end,
   calibration signature math, expected timing variability, and GAE assumptions.
 - `docs/CHEAP_BRASS_PIEZO_GUIDE.md` explains how to sort, pair, and validate
@@ -181,7 +191,7 @@ Every push to this GitHub repo automatically builds the app (see the *Actions*
 tab). To install it, on your phone's browser:
 
 1. Open the repo's **Releases** page:
-   `https://github.com/JeralInnovations/Chrono/releases`
+   `https://github.com/JeralInnovations/ChronoWaveform/releases`
 2. Under **Latest app build**, download `app-debug.apk`.
 3. Open the downloaded file. Android will warn about installing unknown apps —
    allow it for your browser when prompted, then tap *Install*.
@@ -196,7 +206,7 @@ You don't need any Android experience; Android Studio does everything.
 
 1. **Install Android Studio** (free) from https://developer.android.com/studio
    — accept the defaults during setup so it installs the Android SDK.
-2. *File → Open…* and select the **`Chrono/android`** folder (the folder itself,
+2. *File → Open…* and select the **`ChronoWaveform/android`** folder (the folder itself,
    not a file inside it). Click *Trust Project* if asked.
 3. Wait for the first **Gradle sync** to finish (bottom status bar — the first one
    downloads a few hundred MB of build tools; later syncs are fast). If prompted to
@@ -366,9 +376,10 @@ Service `a5c40001-9d95-4e4c-8c5a-c1d6f2a80de1`
 | Cal     | `a5c40006` | read/notify | `ch:u8, status:u8, n:u16, median:u32, mean:u32, stddev:u32, min:u32` ns (LE) |
 | Info    | `a5c40007` | read | revisions, timing model, MCU serial, channels, input stage, capabilities |
 | Health  | `a5c40008` | read/notify | version, channels, per-port flags/signatures, boot-relative check time |
+| Trace   | `a5c40009` | read/notify | chunked 24-bit edge offsets, channel/level metadata, trace flags, and CRC |
 
 States: 0 idle · 1/3 verifying sensor 1/2 · 2/4 sensor 1/2 OK · 5 armed ·
 6 running · 7 calibrating · 8 checking ports · 9 fault/refused.
 Commands: 1/2 verify sensor 1/2 · 3 arm · 4 disarm · 5 ack result (arg=id) ·
 6 cancel · 7 re-send stored results · 8 calibrate (arg=channel) · 9 port health ·
-10 identify · 11 logged arm override.
+10 identify · 11 logged arm override · 12 fetch retained trace (arg=result ID).

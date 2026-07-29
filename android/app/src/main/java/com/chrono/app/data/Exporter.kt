@@ -28,7 +28,9 @@ object Exporter {
                     "disruptor_loading,projectile_type,pass_fail,special_notes,source,date_iso," +
                     "mcu_serial,hardware_revision,firmware_version,battery_mv,boot_id,reset_cause," +
                     "result_flags,port_flags,raw_start_ticks,raw_stop_ticks,format_version,crc_valid," +
-                    "timing_fault,split_time,split_ns,split_ms,distance_m,velocity_mps,velocity_fps"
+                    "timing_fault,split_time,automatic_split_ns,reviewed_split_ns,effective_split_ns," +
+                    "split_ms,distance_m,velocity_mps,velocity_fps,waveform_reviewed," +
+                    "trace_format,trace_flags,trace_event_count"
             )
             for (r in results) {
                 val date = r.epochMillis?.let { Instant.ofEpochMilli(it).toString() } ?: ""
@@ -46,15 +48,35 @@ object Exporter {
                         r.rawStartTicks + "," + r.rawStopTicks + "," + r.formatVersion + "," +
                         r.crcValid + "," + esc(r.timingFaultText().orEmpty()) + "," +
                         esc(r.splitTimeText()) + "," + r.splitNs + "," +
+                        (r.reviewedSplitNs ?: "") + "," + r.effectiveSplitNs + "," +
                         String.format(Locale.US, "%.6f", r.splitMillis) + "," +
                         String.format(Locale.US, "%.5f", r.distanceM) + "," +
                         String.format(Locale.US, "%.3f", r.metersPerSecond) + "," +
-                        String.format(Locale.US, "%.2f", r.feetPerSecond)
+                        String.format(Locale.US, "%.2f", r.feetPerSecond) + "," +
+                        r.isWaveformReviewed + "," + r.traceFormatVersion + "," +
+                        r.traceFlags + "," + r.waveformEvents().size
                 )
             }
         })
 
         val uris = arrayListOf(uriFor(context, csv))
+        val traced = results.filter { it.hasWaveform }
+        if (traced.isNotEmpty()) {
+            val waveformCsv = File(dir, "chrono_waveforms_$tag$stamp.csv")
+            waveformCsv.writeText(buildString {
+                appendLine("result_uid,label,event_index,channel,level,offset_ticks,offset_ns")
+                for (result in traced) {
+                    result.waveformEvents().forEachIndexed { index, event ->
+                        appendLine(
+                            esc(result.uid) + "," + esc(result.label) + "," + index + "," +
+                                (event.channel + 1) + "," + (if (event.high) 1 else 0) + "," +
+                                event.offsetTicks + "," + ticksToNanoseconds(event.offsetTicks)
+                        )
+                    }
+                }
+            })
+            uris.add(uriFor(context, waveformCsv))
+        }
         val cal = File(context.filesDir, if (simulated) "cal_history_sim.jsonl" else "cal_history.jsonl")
         if (cal.exists()) {
             val calCopy = File(dir, "chrono_cal_$tag$stamp.jsonl")

@@ -3,10 +3,9 @@
 /*
  * Chrono — BLE chronograph firmware for the two-channel nRF52840 logger
  * ---------------------------------------------------------------------
- * Two piezo triggers act as START and STOP gates. When armed, a rising
- * edge on SENSOR 1 marks the start and a rising edge on SENSOR 2 marks
- * the stop; the split between them is delivered to the phone over BLE
- * (including after a disconnect and automatic reconnect).
+ * Two piezo triggers act as START and STOP gates. The original first-rising-
+ * edge split is retained, while every observable high/low transition is also
+ * timestamped and delivered to the phone as a reviewable digital waveform.
  *
  * TIMING PATH — this is the whole point of the device, so it is done in
  * hardware, not software:
@@ -17,8 +16,9 @@
  * arrives, with zero dependence on the CPU or the BLE SoftDevice. The
  * capture path is identical on both channels, so its fixed latency
  * cancels in (stop - start). A PPI "fork" disables each channel's own
- * capture on its first edge, so piezo ringing cannot overwrite a
- * timestamp. The high-frequency crystal (HFXO) is requested while armed
+ * first-edge capture on its first edge, so piezo ringing cannot overwrite the
+ * automatic timestamp. A second PPI path keeps timestamping later transitions
+ * for the diagnostic trace. The high-frequency crystal (HFXO) is requested while armed
  * so the timer runs at an accurate 16 MHz (62.5 ns/tick) rather than off
  * the ±1.5% internal RC oscillator.
  *
@@ -31,7 +31,11 @@
  *   Pins use the internal pull-DOWN; a trigger is any rising edge past the
  *   input threshold. Match the two channels (piezo, clamp, CABLE LENGTH).
  *
- * XIAO nRF52840 build. This sketch selects the XIAO board profile above.
+ * Supported builds:
+ *   ChronographNiceNano/ChronographNiceNano.ino - nice!nano v2, 1S LiPo
+ *   ChronographXiao/ChronographXiao.ino         - XIAO nRF52840, 1S LiPo
+ *
+ * Both use a Bluefruit-compatible nRF52840 Arduino core.
  */
 
 // Arduino generates function prototypes before the later packet definitions.
@@ -90,14 +94,36 @@ void statusLedWrite(bool on) { nrf_gpio_pin_write(STATUS_LED_GPIO, on ? 1 : 0); 
 
 // Hardware channels for the capture path. The S140 SoftDevice reserves
 // PPI channels 17-31 and groups 4-5, so low numbers are free for us.
-const uint8_t GPIOTE_S1 = 0;
-const uint8_t GPIOTE_S2 = 1;
+uint8_t GPIOTE_S1 = 0;
+uint8_t GPIOTE_S2 = 1;
+uint32_t GPIOTE_MASK_S1 = 1UL << 0;
+uint32_t GPIOTE_MASK_S2 = 1UL << 1;
 const uint8_t PPI_S1     = 0;
 const uint8_t PPI_S2     = 1;
 const uint8_t PPI_START_ENABLES_STOP = 2;
+const uint8_t PPI_TRACE_S1 = 3;
+const uint8_t PPI_TRACE_S2 = 4;
 const uint8_t PPI_GRP_S1 = 0;
 const uint8_t PPI_GRP_S2 = 1;
+const uint8_t PPI_GRP_START = 2;
 const uint32_t TIMER_HZ = 16000000UL;   // TIMER2 @ 16 MHz, PRESCALER 0
+const uint16_t MAX_TRACE_EVENTS = 256;
+const uint32_t TRACE_CAPTURE_MS = 250UL;
+const uint8_t TRACE_FORMAT_VERSION = 1;
+const uint8_t TRACE_EVENTS_PER_CHUNK = 40;
+
+enum : uint8_t {
+  TRACE_OVERFLOW = 1 << 0,
+  TRACE_EDGE_LOSS_SUSPECTED = 1 << 1,
+  TRACE_STOP_ACTIVITY_BEFORE_START = 1 << 2,
+};
+
+struct __attribute__((packed)) TraceEvent {
+  uint8_t tick0;     // 24-bit offset from traceBaseTicks, little-endian
+  uint8_t tick1;
+  uint8_t tick2;
+  uint8_t meta;      // bit0 channel (0=CH1, 1=CH2), bit1 level after edge
+};
 
 // ------------------------------------------------------------ protocol
 // Device states reported on the STATUS characteristic
@@ -127,6 +153,7 @@ enum : uint8_t {
   CMD_HEALTH    = 9, // run both port checks without arming
   CMD_IDENTIFY  = 10,// flash this logger's status LED
   CMD_ARM_OVERRIDE = 11, // logged override of a port-health arm refusal
+  CMD_FETCH_TRACE = 12,  // arg = result id; send retained waveform chunks
 };
 
 // 128-bit UUIDs. Base: A5C4xxxx-9D95-4E4C-8C5A-C1D6F2A80DE1
@@ -144,6 +171,7 @@ const uint8_t UUID_TIME   [16] = CHRONO_UUID(0x0005);
 const uint8_t UUID_CAL    [16] = CHRONO_UUID(0x0006);
 const uint8_t UUID_INFO   [16] = CHRONO_UUID(0x0007);
 const uint8_t UUID_HEALTH [16] = CHRONO_UUID(0x0008);
+const uint8_t UUID_TRACE  [16] = CHRONO_UUID(0x0009);
 
 BLEService        svc     (UUID_SERVICE);
 BLECharacteristic chStatus (UUID_STATUS);   // read/notify: StatusPacket below
@@ -153,6 +181,7 @@ BLECharacteristic chTime   (UUID_TIME);     // write: uint32 LE unix seconds
 BLECharacteristic chCal    (UUID_CAL);      // read/notify: CalResult struct below
 BLECharacteristic chInfo   (UUID_INFO);     // read: HwInfo struct below
 BLECharacteristic chHealth (UUID_HEALTH);   // read/notify: HealthPacket below
+BLECharacteristic chTrace  (UUID_TRACE);    // read/notify: chunked TraceEvent stream
 
 // One measurement on the wire. 11 bytes LE — parsed byte-for-byte by the app.
 struct __attribute__((packed)) Result {
@@ -187,6 +216,10 @@ struct Pending {
   uint32_t stopTicks;
   uint16_t batteryMv;
   uint16_t portFlags;
+  uint32_t traceBaseTicks;
+  uint16_t traceCount;
+  uint8_t  traceFlags;
+  TraceEvent trace[MAX_TRACE_EVENTS];
 };
 
 // Results wait here until the phone ACKs them, so nothing is lost if
@@ -211,8 +244,8 @@ struct __attribute__((packed)) CalResult {
 // accuracy model. A future revision with tighter timing (e.g. a TDC front
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
-const uint8_t FW_MAJOR = 2;
-const uint8_t FW_MINOR = 1;
+const uint8_t FW_MAJOR = 3;
+const uint8_t FW_MINOR = 0;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -274,12 +307,21 @@ bool     started  = false;
 bool     finished = false;
 
 bool     fetchRequested = false;
+volatile uint16_t traceFetchRequested = 0;
 bool     hfxoOn         = false;
 volatile uint8_t calRequested = 0;   // 1 or 2; handled in loop()
 volatile uint8_t healthRequested = 0; // 1 normal, 2 logged override arm
 uint32_t identifyUntilMs = 0;
 uint32_t startedAtMs = 0;
+uint32_t traceStartedAtMs = 0;
 uint8_t activeResultFlags = 0;
+volatile bool traceRecording = false;
+volatile bool stopActivityBeforeStart = false;
+volatile uint16_t activeTraceCount = 0;
+volatile uint8_t activeTraceFlags = 0;
+volatile uint32_t activeTraceBaseTicks = 0;
+volatile uint8_t activeTraceLastLevel[2] = { 0, 0 };
+TraceEvent activeTrace[MAX_TRACE_EVENTS];
 HealthPacket health = { 1, 2, PORT_MISSING_SENSOR, PORT_MISSING_SENSOR, 0, 0, 0 };
 uint32_t bootId = 0;
 uint32_t resetCause = 0;
@@ -300,6 +342,7 @@ volatile uint8_t  ackHead = 0, ackTail = 0;
 uint32_t lastBatteryNotifyMs = 0;
 uint16_t filteredBatteryMv = 0;
 bool batteryArmLocked = false;
+uint32_t sensorGpio[2] = { 0, 0 };
 
 // Wall-clock: the phone writes unix time; we extrapolate with millis().
 bool     timeValid  = false;
@@ -307,9 +350,58 @@ uint32_t epochBase  = 0;
 uint32_t millisBase = 0;
 
 // --------------------------------------------------- hardware timing core
+void appendTraceEvent(uint8_t channel, uint32_t ticks, bool level) {
+  if (!traceRecording) return;
+
+  uint16_t index = activeTraceCount;
+  if (index >= MAX_TRACE_EVENTS) {
+    activeTraceFlags |= TRACE_OVERFLOW;
+    return;
+  }
+
+  if (index == 0) {
+    activeTraceBaseTicks = ticks;
+    traceStartedAtMs = millis();
+  } else if (activeTraceLastLevel[channel] == (uint8_t)(level ? 1 : 0)) {
+    // A valid digital waveform must alternate on each channel. Matching
+    // consecutive levels means at least one transition happened before the
+    // GPIOTE ISR copied its hardware-captured timestamp.
+    activeTraceFlags |= TRACE_EDGE_LOSS_SUSPECTED;
+  }
+
+  uint32_t delta = ticks - activeTraceBaseTicks;
+  if (delta > 0xFFFFFFUL) {
+    activeTraceFlags |= TRACE_OVERFLOW;
+    return;
+  }
+
+  TraceEvent& event = activeTrace[index];
+  event.tick0 = (uint8_t)(delta & 0xFF);
+  event.tick1 = (uint8_t)((delta >> 8) & 0xFF);
+  event.tick2 = (uint8_t)((delta >> 16) & 0xFF);
+  event.meta = (uint8_t)((channel & 1U) | (level ? 0x02U : 0U));
+  activeTraceLastLevel[channel] = level ? 1 : 0;
+  activeTraceCount = index + 1;
+
+  if (channel == 1 && NRF_TIMER2->CC[0] == 0xFFFFFFFFUL) {
+    stopActivityBeforeStart = true;
+    activeTraceFlags |= TRACE_STOP_ACTIVITY_BEFORE_START;
+  }
+}
+
+void onSensor1Change() {
+  appendTraceEvent(0, NRF_TIMER2->CC[2], nrf_gpio_pin_read(sensorGpio[0]) != 0);
+}
+
+void onSensor2Change() {
+  appendTraceEvent(1, NRF_TIMER2->CC[3], nrf_gpio_pin_read(sensorGpio[1]) != 0);
+}
+
 void setupTiming() {
   uint32_t p1 = g_ADigitalPinMap[SENSOR1_PIN];   // Arduino pin -> nRF pin number
   uint32_t p2 = g_ADigitalPinMap[SENSOR2_PIN];
+  sensorGpio[0] = p1;
+  sensorGpio[1] = p2;
 
   nrf_gpio_cfg_input(p1, NRF_GPIO_PIN_PULLDOWN);
   nrf_gpio_cfg_input(p2, NRF_GPIO_PIN_PULLDOWN);
@@ -327,15 +419,21 @@ void setupTiming() {
   NRF_TIMER2->TASKS_CLEAR = 1;
   NRF_TIMER2->TASKS_START = 1;
 
-  // GPIOTE event channels, rising edge on each sensor pin.
-  NRF_GPIOTE->CONFIG[GPIOTE_S1] =
-      (GPIOTE_CONFIG_MODE_Event      << GPIOTE_CONFIG_MODE_Pos)     |
-      (p1                            << GPIOTE_CONFIG_PSEL_Pos)     |
-      (GPIOTE_CONFIG_POLARITY_LoToHi << GPIOTE_CONFIG_POLARITY_Pos);
-  NRF_GPIOTE->CONFIG[GPIOTE_S2] =
-      (GPIOTE_CONFIG_MODE_Event      << GPIOTE_CONFIG_MODE_Pos)     |
-      (p2                            << GPIOTE_CONFIG_PSEL_Pos)     |
-      (GPIOTE_CONFIG_POLARITY_LoToHi << GPIOTE_CONFIG_POLARITY_Pos);
+  // The Arduino core owns GPIOTE_IRQHandler. Register CHANGE callbacks so it
+  // allocates compatible channels, then use those same hardware events for
+  // PPI timestamp capture. Interrupts stay disabled outside live shots so the
+  // existing calibration polling path remains deterministic.
+  uint32_t mask1 = (uint32_t)attachInterrupt(SENSOR1_PIN, onSensor1Change, CHANGE);
+  uint32_t mask2 = (uint32_t)attachInterrupt(SENSOR2_PIN, onSensor2Change, CHANGE);
+  if (mask1) {
+    GPIOTE_MASK_S1 = mask1;
+    GPIOTE_S1 = (uint8_t)__builtin_ctz(mask1);
+  }
+  if (mask2) {
+    GPIOTE_MASK_S2 = mask2;
+    GPIOTE_S2 = (uint8_t)__builtin_ctz(mask2);
+  }
+  NRF_GPIOTE->INTENCLR = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
 
   // PPI: edge -> TIMER capture, and (fork) -> disable this channel's own
   // group so only the FIRST edge is captured (immune to piezo ringing).
@@ -347,15 +445,25 @@ void setupTiming() {
   NRF_PPI->CH[PPI_S2].TEP   = (uint32_t)&NRF_TIMER2->TASKS_CAPTURE[1];
   NRF_PPI->FORK[PPI_S2].TEP = (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS;
 
+  // Continuous trace path. These capture registers are copied by the GPIOTE
+  // callbacks; unlike CC0/CC1 they intentionally update on every transition.
+  NRF_PPI->CH[PPI_TRACE_S1].EEP = (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_S1];
+  NRF_PPI->CH[PPI_TRACE_S1].TEP = (uint32_t)&NRF_TIMER2->TASKS_CAPTURE[2];
+  NRF_PPI->CH[PPI_TRACE_S2].EEP = (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_S2];
+  NRF_PPI->CH[PPI_TRACE_S2].TEP = (uint32_t)&NRF_TIMER2->TASKS_CAPTURE[3];
+
   // START enables the STOP capture group in hardware. STOP is therefore not
   // timestampable before START, without relying on firmware reaction time.
   NRF_PPI->CH[PPI_START_ENABLES_STOP].EEP =
       (uint32_t)&NRF_GPIOTE->EVENTS_IN[GPIOTE_S1];
   NRF_PPI->CH[PPI_START_ENABLES_STOP].TEP =
       (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_S2].EN;
+  NRF_PPI->FORK[PPI_START_ENABLES_STOP].TEP =
+      (uint32_t)&NRF_PPI->TASKS_CHG[PPI_GRP_START].DIS;
 
   NRF_PPI->CHG[PPI_GRP_S1] = (1UL << PPI_S1);
   NRF_PPI->CHG[PPI_GRP_S2] = (1UL << PPI_S2);
+  NRF_PPI->CHG[PPI_GRP_START] = (1UL << PPI_START_ENABLES_STOP);
 }
 
 bool requestHfxo() {
@@ -376,22 +484,39 @@ void releaseHfxo() {
 // Prepare the capture hardware with START enabled and STOP hardware-gated.
 bool armTiming() {
   if (!requestHfxo()) return false;
+  NRF_GPIOTE->INTENCLR = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
   NRF_GPIOTE->EVENTS_IN[GPIOTE_S1] = 0;
   NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
   (void)NRF_GPIOTE->EVENTS_IN[GPIOTE_S2];     // flush the clears before continuing
   NRF_TIMER2->TASKS_CLEAR = 1;
   NRF_TIMER2->CC[0] = 0xFFFFFFFFUL;
   NRF_TIMER2->CC[1] = 0xFFFFFFFFUL;
+  NRF_TIMER2->CC[2] = 0xFFFFFFFFUL;
+  NRF_TIMER2->CC[3] = 0xFFFFFFFFUL;
+  activeTraceCount = 0;
+  activeTraceFlags = 0;
+  activeTraceBaseTicks = 0;
+  activeTraceLastLevel[0] = nrf_gpio_pin_read(sensorGpio[0]) ? 1 : 0;
+  activeTraceLastLevel[1] = nrf_gpio_pin_read(sensorGpio[1]) ? 1 : 0;
+  stopActivityBeforeStart = false;
+  traceStartedAtMs = 0;
+  traceRecording = true;
   NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS = 1;
-  NRF_PPI->CHENSET = (1UL << PPI_START_ENABLES_STOP);
+  NRF_PPI->TASKS_CHG[PPI_GRP_START].DIS = 1;
+  NRF_PPI->CHENSET = (1UL << PPI_TRACE_S1) | (1UL << PPI_TRACE_S2);
   NRF_PPI->TASKS_CHG[PPI_GRP_S1].EN = 1;
+  NRF_PPI->TASKS_CHG[PPI_GRP_START].EN = 1;
+  NRF_GPIOTE->INTENSET = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
   return true;
 }
 
 void disarmTiming() {
+  traceRecording = false;
+  NRF_GPIOTE->INTENCLR = GPIOTE_MASK_S1 | GPIOTE_MASK_S2;
   NRF_PPI->TASKS_CHG[PPI_GRP_S1].DIS = 1;
   NRF_PPI->TASKS_CHG[PPI_GRP_S2].DIS = 1;
-  NRF_PPI->CHENCLR = (1UL << PPI_START_ENABLES_STOP);
+  NRF_PPI->TASKS_CHG[PPI_GRP_START].DIS = 1;
+  NRF_PPI->CHENCLR = (1UL << PPI_TRACE_S1) | (1UL << PPI_TRACE_S2);
   releaseHfxo();
 }
 
@@ -687,6 +812,59 @@ void notifyPending(const Pending& p) {
   chResult.notify((uint8_t*)&r, sizeof(r));
 }
 
+void notifyTrace(const Pending& p) {
+  uint8_t chunkCount = (uint8_t)((p.traceCount + TRACE_EVENTS_PER_CHUNK - 1) /
+                                 TRACE_EVENTS_PER_CHUNK);
+  if (chunkCount == 0) chunkCount = 1;
+
+  for (uint8_t chunk = 0; chunk < chunkCount; chunk++) {
+    uint16_t eventStart = (uint16_t)chunk * TRACE_EVENTS_PER_CHUNK;
+    uint8_t eventCount = 0;
+    if (eventStart < p.traceCount) {
+      uint16_t remaining = p.traceCount - eventStart;
+      eventCount = (uint8_t)(remaining > TRACE_EVENTS_PER_CHUNK
+          ? TRACE_EVENTS_PER_CHUNK : remaining);
+    }
+
+    uint8_t packet[180] = {};
+    packet[0] = (uint8_t)(p.id & 0xFF);
+    packet[1] = (uint8_t)(p.id >> 8);
+    packet[2] = TRACE_FORMAT_VERSION;
+    packet[3] = p.traceFlags;
+    packet[4] = chunk;
+    packet[5] = chunkCount;
+    packet[6] = eventCount;
+    packet[8] = (uint8_t)(p.traceCount & 0xFF);
+    packet[9] = (uint8_t)(p.traceCount >> 8);
+    packet[10] = (uint8_t)(eventStart & 0xFF);
+    packet[11] = (uint8_t)(eventStart >> 8);
+    packet[12] = (uint8_t)(p.traceBaseTicks & 0xFF);
+    packet[13] = (uint8_t)((p.traceBaseTicks >> 8) & 0xFF);
+    packet[14] = (uint8_t)((p.traceBaseTicks >> 16) & 0xFF);
+    packet[15] = (uint8_t)((p.traceBaseTicks >> 24) & 0xFF);
+    if (eventCount) {
+      memcpy(&packet[16], &p.trace[eventStart], eventCount * sizeof(TraceEvent));
+    }
+    uint16_t payloadLen = (uint16_t)(16 + eventCount * sizeof(TraceEvent));
+    uint16_t crc = crc16Ccitt(packet, payloadLen);
+    packet[payloadLen] = (uint8_t)(crc & 0xFF);
+    packet[payloadLen + 1] = (uint8_t)(crc >> 8);
+    uint16_t packetLen = payloadLen + 2;
+    chTrace.write(packet, packetLen);
+    chTrace.notify(packet, packetLen);
+    delay(15);
+  }
+}
+
+void notifyTraceById(uint16_t id) {
+  for (uint8_t i = 0; i < pendingCount; i++) {
+    if (pending[i].id == id) {
+      notifyTrace(pending[i]);
+      return;
+    }
+  }
+}
+
 void storeResult(uint32_t splitNs, uint8_t flags, uint32_t startTicks, uint32_t stopTicks) {
   if (pendingCount >= MAX_PENDING) {           // buffer full: drop the oldest
     memmove(&pending[0], &pending[1], sizeof(pending[0]) * (MAX_PENDING - 1));
@@ -702,6 +880,12 @@ void storeResult(uint32_t splitNs, uint8_t flags, uint32_t startTicks, uint32_t 
   p.batteryMv = sampleBatteryMv();
   p.portFlags = (uint16_t)((health.channel1Flags & 0xFF) |
                            ((health.channel2Flags & 0xFF) << 8));
+  p.traceBaseTicks = activeTraceBaseTicks;
+  p.traceCount = activeTraceCount;
+  p.traceFlags = activeTraceFlags;
+  if (p.traceCount) {
+    memcpy(p.trace, activeTrace, p.traceCount * sizeof(TraceEvent));
+  }
   notifyPending(p);  // no-op if nobody is connected/subscribed; FETCH re-sends
 }
 
@@ -788,6 +972,9 @@ void onControlWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, ui
     }
     case CMD_FETCH:
       fetchRequested = true;   // handled in loop() — keeps this callback quick
+      break;
+    case CMD_FETCH_TRACE:
+      traceFetchRequested = arg;
       break;
     case CMD_CALIBRATE:
       // Deferred to loop() like FETCH; refused while a shot could arrive.
@@ -890,7 +1077,7 @@ void setup() {
   // conservative 300 ns per-edge threshold-walk allowance.
   HwInfo info = {
     HW_REV, FW_MAJOR, FW_MINOR, 0, 62500UL, 30, 300,
-    NRF_FICR->DEVICEID[0], NRF_FICR->DEVICEID[1], 2, 1, 0x0007
+    NRF_FICR->DEVICEID[0], NRF_FICR->DEVICEID[1], 2, 1, 0x000F
   };
   chInfo.write((uint8_t*)&info, sizeof(info));
 
@@ -899,6 +1086,11 @@ void setup() {
   chHealth.setFixedLen(sizeof(HealthPacket));
   chHealth.begin();
   chHealth.write((uint8_t*)&health, sizeof(health));
+
+  chTrace.setProperties(CHR_PROPS_READ | CHR_PROPS_NOTIFY);
+  chTrace.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  chTrace.setMaxLen(180);
+  chTrace.begin();
 
   notifyStatus();
 
@@ -925,27 +1117,25 @@ void loop() {
 
     case ST_ARMED:
     case ST_RUNNING:
-      // Timestamps are already frozen in TIMER2->CC by hardware; here we
-      // only notice that the edges happened and read the captured values.
-      if (!started && NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] &&
-          NRF_TIMER2->CC[1] == 0xFFFFFFFFUL) {
-        NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
-        finishTimingFault(RESULT_STOP_BEFORE_START);
-        break;
-      }
-      if (!started && NRF_GPIOTE->EVENTS_IN[GPIOTE_S1]) {
-        NRF_GPIOTE->EVENTS_IN[GPIOTE_S1] = 0;
+      // GPIOTE_IRQHandler clears event registers after copying trace samples,
+      // so the preserved first-edge capture registers are the source of truth.
+      if (!started && NRF_TIMER2->CC[0] != 0xFFFFFFFFUL) {
         started = true;
         startedAtMs = millis();
         setState(ST_RUNNING);
       }
-      if (started && !finished && NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] &&
-          NRF_TIMER2->CC[1] != 0xFFFFFFFFUL) {
-        NRF_GPIOTE->EVENTS_IN[GPIOTE_S2] = 0;
+      if (started && !finished && NRF_TIMER2->CC[1] != 0xFFFFFFFFUL) {
         finished = true;
+      }
+
+      // Do not end at the automatic STOP edge. Keep the inputs live long
+      // enough to capture the later impact/ringing that the user may select.
+      if (started && finished &&
+          (uint32_t)(millis() - startedAtMs) >= TRACE_CAPTURE_MS) {
         uint32_t ticks = NRF_TIMER2->CC[1] - NRF_TIMER2->CC[0];  // wrap-safe
         uint32_t splitNs = (uint32_t)(((uint64_t)ticks * 1000000000ULL) / TIMER_HZ);
         uint8_t flags = activeResultFlags;
+        if (stopActivityBeforeStart) flags |= RESULT_STOP_BEFORE_START;
         if (splitNs < MIN_SPLIT_NS) flags |= RESULT_SPLIT_TOO_SHORT;
         if (splitNs > MAX_SPLIT_NS) flags |= RESULT_SPLIT_TOO_LONG;
         armed = false;
@@ -954,8 +1144,12 @@ void loop() {
         disarmTiming();
         storeResult(splitNs, flags, NRF_TIMER2->CC[0], NRF_TIMER2->CC[1]);
         setState((flags & (RESULT_SPLIT_TOO_SHORT | RESULT_SPLIT_TOO_LONG)) ? ST_FAULT : ST_IDLE);
-      } else if (started && (uint32_t)(millis() - startedAtMs) >= STOP_TIMEOUT_MS) {
+      } else if (started && !finished &&
+                 (uint32_t)(millis() - startedAtMs) >= STOP_TIMEOUT_MS) {
         finishTimingFault(RESULT_STOP_TIMEOUT);
+      } else if (!started && stopActivityBeforeStart && traceStartedAtMs &&
+                 (uint32_t)(millis() - traceStartedAtMs) >= STOP_TIMEOUT_MS) {
+        finishTimingFault(RESULT_STOP_BEFORE_START);
       }
       break;
 
@@ -999,6 +1193,12 @@ void loop() {
       notifyPending(pending[i]);
       delay(15);   // give the BLE stack room between notifications
     }
+  }
+
+  if (traceFetchRequested) {
+    uint16_t id = traceFetchRequested;
+    traceFetchRequested = 0;
+    notifyTraceById(id);
   }
 
   if ((uint32_t)(millis() - lastBatteryNotifyMs) >= 30000UL) {

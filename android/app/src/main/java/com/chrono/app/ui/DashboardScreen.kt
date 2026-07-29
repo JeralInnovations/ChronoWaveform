@@ -142,6 +142,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     val running = state == Proto.ST_RUNNING
     val health by vm.ble.health.collectAsState()
     var editing by remember { mutableStateOf<TestResult?>(null) }
+    var waveformReviewUid by remember { mutableStateOf<String?>(null) }
     var manualEntry by remember { mutableStateOf(false) }
     // (photo uri, owning result uid) so the viewer can offer "set as cover"
     var fullscreenPhoto by remember { mutableStateOf<Pair<android.net.Uri, String>?>(null) }
@@ -347,6 +348,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     coverFor = { vm.photosFor(r) },
                     onEdit = { editing = r },
                     onOpenPhoto = { fullscreenPhoto = it to r.uid },
+                    onReviewWaveform = { waveformReviewUid = r.uid },
                 )
             }
         }
@@ -452,6 +454,10 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
 
     // Shots received (e.g. after walking back into range): review, then photos.
     if (vm.newShots.isNotEmpty() && vm.retestSensor == null) {
+        val waveformShot = vm.newShots.firstOrNull { it.hasWaveform }
+        val waitingForWaveform = vm.newShots.any {
+            it.firmwareVersion.startsWith("3.") && !it.hasWaveform
+        }
         AlertDialog(
             onDismissRequest = { vm.dismissShotReview() },
             title = {
@@ -484,7 +490,23 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 }
             },
             confirmButton = {
-                TextButton(onClick = { vm.dismissShotReview() }) { Text("Continue") }
+                if (waveformShot != null) {
+                    TextButton(onClick = { waveformReviewUid = waveformShot.uid }) {
+                        Text("Review waveform")
+                    }
+                } else {
+                    TextButton(
+                        onClick = { vm.dismissShotReview() },
+                        enabled = !waitingForWaveform,
+                    ) { Text(if (waitingForWaveform) "Receiving waveform…" else "Continue") }
+                }
+            },
+            dismissButton = {
+                if (waveformShot != null || waitingForWaveform) {
+                    TextButton(onClick = { vm.dismissShotReview() }) {
+                        Text(if (waitingForWaveform) "Continue without waveform" else "Use automatic")
+                    }
+                }
             },
         )
     }
@@ -580,6 +602,21 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 }
             }
         }
+    }
+
+    waveformReviewUid?.let { uid ->
+        vm.results.firstOrNull { it.uid == uid }?.let { result ->
+            WaveformReviewDialog(
+                result = result,
+                onDismiss = { waveformReviewUid = null },
+                onApply = { start, stop ->
+                    vm.applyReviewedTiming(uid, start, stop)
+                    waveformReviewUid = null
+                    if (vm.newShots.any { it.uid == uid }) vm.dismissShotReview()
+                },
+                onReset = { vm.resetReviewedTiming(uid) },
+            )
+        } ?: run { waveformReviewUid = null }
     }
 
     if (manualEntry) {
@@ -1524,6 +1561,7 @@ private fun ResultCard(
     coverFor: () -> List<android.net.Uri>,
     onEdit: () -> Unit,
     onOpenPhoto: (android.net.Uri) -> Unit,
+    onReviewWaveform: (() -> Unit)? = null,
 ) {
     // Resolve the cover image off the main thread: chosen thumbnail, else first photo.
     val cover by androidx.compose.runtime.produceState<android.net.Uri?>(
@@ -1557,7 +1595,7 @@ private fun ResultCard(
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        if (r.metersPerSecond > 0) "%.1f".format(r.feetPerSecond) else "—",
+                        if (r.metersPerSecond != 0.0) "%.1f".format(r.feetPerSecond) else "—",
                         fontFamily = FontFamily.Monospace,
                         fontSize = 36.sp,
                         color = Amber,
@@ -1569,7 +1607,7 @@ private fun ResultCard(
                 val envelopeText = if (accuracyEnvelopePercent >= 0.05)
                     "+/- %.1f%% GAE".format(accuracyEnvelopePercent) else "+/- <0.1% GAE"
                 val detail = when {
-                    r.isManual && r.metersPerSecond > 0 ->
+                    r.isManual && r.metersPerSecond != 0.0 ->
                         "%.2f m/s  ·  manual entry".format(r.metersPerSecond)
                     r.isManual -> "manual entry"
                     else -> "%.2f m/s  -  %s  -  %s".format(
@@ -1581,6 +1619,14 @@ private fun ResultCard(
                     style = MaterialTheme.typography.bodyMedium,
                     color = if (r.isManual) Teal else TextDim,
                 )
+                if (r.hasWaveform && onReviewWaveform != null) {
+                    Spacer(Modifier.height(6.dp))
+                    OutlinedButton(onClick = onReviewWaveform) {
+                        Icon(Icons.Filled.AccessTime, null, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.size(6.dp))
+                        Text(if (r.isWaveformReviewed) "Reviewed waveform" else "Review waveform")
+                    }
+                }
                 r.timingFaultText()?.let { fault ->
                     Spacer(Modifier.height(6.dp))
                     Text(fault, style = MaterialTheme.typography.bodyMedium, color = Bad)
@@ -1896,7 +1942,7 @@ private fun EditResultDialog(
             Column(Modifier.verticalScroll(rememberScrollState())) {
                 if (showRecordedValues) {
                     val spacingIn = result.distanceM * 39.3701
-                    val velocityText = if (result.metersPerSecond > 0)
+                    val velocityText = if (result.metersPerSecond != 0.0)
                         "%.1f ft/s".format(result.feetPerSecond) else "Not recorded"
                     ReadOnlyLogValue("Velocity", velocityText)
                     ReadOnlyLogValue("SENSOR SPACING", "%.3f in".format(spacingIn))

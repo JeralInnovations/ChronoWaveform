@@ -12,11 +12,14 @@ import com.chrono.app.ble.ChronoBle
 import com.chrono.app.ble.ConnState
 import com.chrono.app.ble.Proto
 import com.chrono.app.ble.RawResult
+import com.chrono.app.ble.RawTrace
 import android.net.Uri
 import com.chrono.app.data.DistanceUnit
 import com.chrono.app.data.ResultStore
 import com.chrono.app.data.SessionManager
 import com.chrono.app.data.TestResult
+import com.chrono.app.data.WaveformCodec
+import com.chrono.app.data.ticksToNanoseconds
 import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -254,6 +257,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         reloadForMode()
         viewModelScope.launch { ble.cal.collect { onCalReading(it) } }
         viewModelScope.launch { ble.results.collect { onRawResult(it) } }
+        viewModelScope.launch { ble.traces.collect { onRawTrace(it) } }
         viewModelScope.launch {
             ble.health.collect { health -> health?.let { appendHealthHistory(it) } }
         }
@@ -323,6 +327,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     /** Shots just received and not yet reviewed — drives the results screen
      *  that appears after (re)connecting, before the after-photos prompt. */
     val newShots = mutableStateListOf<TestResult>()
+    private val pendingTraceUids = mutableMapOf<Int, String>()
 
     fun dismissShotReview() {
         newShots.clear()
@@ -331,11 +336,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun onRawResult(r: RawResult) {
         // FETCH after a reconnect can re-deliver a result we already stored.
-        val duplicate = results.any {
+        val existing = results.firstOrNull {
             it.deviceResultId == r.id && it.splitNs == r.splitNs &&
                 (r.bootId == 0L || it.bootId == 0L || it.bootId == r.bootId)
         }
-        if (!duplicate) {
+        val traceCapable =
+            ((ble.hwInfo.value?.capabilities ?: 0) and Proto.CAP_EDGE_TRACE) != 0
+        if (existing == null) {
             val rec = TestResult(
                 uid = UUID.randomUUID().toString(),
                 deviceResultId = r.id,
@@ -382,9 +389,69 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             // sensor-attach flow re-measures the fresh screen's load).
             setSensorReady(1, false)
             setSensorReady(2, false)
+            if (traceCapable) {
+                pendingTraceUids[r.id] = rec.uid
+                ble.sendCommand(Proto.CMD_FETCH_TRACE, r.id)
+            } else {
+                ble.sendCommand(Proto.CMD_ACK, r.id)
+            }
+        } else if (traceCapable && !existing.hasWaveform) {
+            pendingTraceUids[r.id] = existing.uid
+            ble.sendCommand(Proto.CMD_FETCH_TRACE, r.id)
+        } else {
+            ble.sendCommand(Proto.CMD_ACK, r.id)
         }
-        // Tell the device it can forget this result now that it's stored on the phone.
-        ble.sendCommand(Proto.CMD_ACK, r.id)
+    }
+
+    private fun onRawTrace(trace: RawTrace) {
+        val uid = pendingTraceUids.remove(trace.resultId)
+            ?: results.firstOrNull { it.deviceResultId == trace.resultId && !it.hasWaveform }?.uid
+            ?: return
+        val index = results.indexOfFirst { it.uid == uid }
+        if (index < 0) return
+        val updated = results[index].copy(
+            traceFormatVersion = trace.formatVersion,
+            traceBaseTicks = trace.baseTicks,
+            traceFlags = trace.flags,
+            traceData = WaveformCodec.encode(trace.events),
+        )
+        results[index] = updated
+        val newIndex = newShots.indexOfFirst { it.uid == uid }
+        if (newIndex >= 0) newShots[newIndex] = updated
+        persist()
+        ble.sendCommand(Proto.CMD_ACK, trace.resultId)
+    }
+
+    fun applyReviewedTiming(uid: String, startOffsetTicks: Long, stopOffsetTicks: Long) {
+        val index = results.indexOfFirst { it.uid == uid }
+        if (index < 0) return
+        val result = results[index]
+        val reviewedNs = ticksToNanoseconds(stopOffsetTicks - startOffsetTicks)
+        val updated = result.copy(
+            reviewedSplitNs = reviewedNs,
+            reviewedStartOffsetTicks = startOffsetTicks,
+            reviewedStopOffsetTicks = stopOffsetTicks,
+            reviewedAtMillis = System.currentTimeMillis(),
+        )
+        results[index] = updated
+        val newIndex = newShots.indexOfFirst { it.uid == uid }
+        if (newIndex >= 0) newShots[newIndex] = updated
+        persist()
+    }
+
+    fun resetReviewedTiming(uid: String) {
+        val index = results.indexOfFirst { it.uid == uid }
+        if (index < 0) return
+        val updated = results[index].copy(
+            reviewedSplitNs = null,
+            reviewedStartOffsetTicks = null,
+            reviewedStopOffsetTicks = null,
+            reviewedAtMillis = null,
+        )
+        results[index] = updated
+        val newIndex = newShots.indexOfFirst { it.uid == uid }
+        if (newIndex >= 0) newShots[newIndex] = updated
+        persist()
     }
 
     fun updateResult(
@@ -526,6 +593,9 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("specialNotes", r.specialNotes.ifBlank { r.outcome })
         .put("outcome", r.specialNotes.ifBlank { r.outcome })
         .put("splitNs", r.splitNs)
+        .put("automaticSplitNs", r.splitNs)
+        .put("reviewedSplitNs", r.reviewedSplitNs ?: JSONObject.NULL)
+        .put("effectiveSplitNs", r.effectiveSplitNs)
         .put("distanceM", r.distanceM)
         .put("velocityMps", r.metersPerSecond)
         .put("velocityFps", r.feetPerSecond)
@@ -543,6 +613,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("firmwareVersion", r.firmwareVersion)
         .put("formatVersion", r.formatVersion)
         .put("crcValid", r.crcValid)
+        .put("traceFormatVersion", r.traceFormatVersion)
+        .put("traceBaseTicks", r.traceBaseTicks)
+        .put("traceFlags", r.traceFlags)
+        .put("traceData", r.traceData)
+        .put("reviewedStartOffsetTicks", r.reviewedStartOffsetTicks ?: JSONObject.NULL)
+        .put("reviewedStopOffsetTicks", r.reviewedStopOffsetTicks ?: JSONObject.NULL)
+        .put("reviewedAtMillis", r.reviewedAtMillis ?: JSONObject.NULL)
         .put("epochMillis", r.epochMillis ?: -1L)
         .apply { r.targetDistValue?.let { put("targetDistValue", it) } }
 
@@ -767,8 +844,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
      * tighten this without changing the app.
      */
     fun accuracyEnvelopePercentFor(r: TestResult): Double {
-        if (r.isManual || r.splitNs <= 0 || r.distanceM <= 0) return 0.0
-        return accuracyEnvelopePercentRaw(r.splitNs.toDouble(), r.distanceM)
+        if (r.isManual || r.effectiveSplitNs == 0L || r.distanceM <= 0) return 0.0
+        return accuracyEnvelopePercentRaw(kotlin.math.abs(r.effectiveSplitNs.toDouble()), r.distanceM)
     }
 
     fun ciPercentFor(r: TestResult): Double = accuracyEnvelopePercentFor(r)

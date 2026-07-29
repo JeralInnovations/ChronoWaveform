@@ -46,17 +46,28 @@ data class TestResult(
     var firmwareVersion: String = "",
     var formatVersion: Int = 1,
     var crcValid: Boolean = true,
+    var traceFormatVersion: Int = 0,
+    var traceBaseTicks: Long = 0,
+    var traceFlags: Int = 0,
+    var traceData: String = "",
+    var reviewedSplitNs: Long? = null,
+    var reviewedStartOffsetTicks: Long? = null,
+    var reviewedStopOffsetTicks: Long? = null,
+    var reviewedAtMillis: Long? = null,
     /** folder id under ChronoData holding this shot's log and photos */
     var shotFolder: String = "",
     /** user-chosen cover image URI for this shot ("" = use the first photo) */
     var thumbnailUri: String = "",
 ) {
     val isManual: Boolean get() = deviceResultId < 0
-    val splitSeconds: Double get() = splitNs / 1_000_000_000.0
-    val splitMillis: Double get() = splitNs / 1_000_000.0
+    val effectiveSplitNs: Long get() = reviewedSplitNs ?: splitNs
+    val isWaveformReviewed: Boolean get() = reviewedSplitNs != null
+    val hasWaveform: Boolean get() = traceFormatVersion > 0
+    val splitSeconds: Double get() = effectiveSplitNs / 1_000_000_000.0
+    val splitMillis: Double get() = effectiveSplitNs / 1_000_000.0
     val metersPerSecond: Double
         get() = manualVelocityMps
-            ?: if (splitNs > 0 && distanceM > 0) distanceM / splitSeconds else 0.0
+            ?: if (effectiveSplitNs != 0L && distanceM > 0) distanceM / splitSeconds else 0.0
     val feetPerSecond: Double get() = metersPerSecond * 3.28084
 
     fun timingFaultText(): String? = when {
@@ -70,14 +81,19 @@ data class TestResult(
     }
 
     fun splitTimeText(): String {
-        if (splitNs <= 0) return "not recorded"
+        val value = effectiveSplitNs
+        if (value == 0L) return "not recorded"
+        val magnitude = kotlin.math.abs(value)
+        val sign = if (value < 0) "-" else ""
         return when {
-            splitNs < 1_000L -> "${splitNs}ns"
-            splitNs < 1_000_000L -> formatWholeish(splitNs / 1_000.0, "us")
-            splitNs < 1_000_000_000L -> formatWholeish(splitNs / 1_000_000.0, "ms")
-            else -> formatWholeish(splitNs / 1_000_000_000.0, "s")
+            magnitude < 1_000L -> "$sign${magnitude}ns"
+            magnitude < 1_000_000L -> sign + formatWholeish(magnitude / 1_000.0, "us")
+            magnitude < 1_000_000_000L -> sign + formatWholeish(magnitude / 1_000_000.0, "ms")
+            else -> sign + formatWholeish(magnitude / 1_000_000_000.0, "s")
         }
     }
+
+    fun waveformEvents(): List<WaveformEvent> = WaveformCodec.decode(traceData)
 
     fun targetDistanceText(): String? =
         targetDistValue?.let {
@@ -167,6 +183,20 @@ class ResultStore(context: Context, simulation: Boolean = false) {
                     firmwareVersion = o.optString("firmwareVersion", ""),
                     formatVersion = o.optInt("formatVersion", 1),
                     crcValid = o.optBoolean("crcValid", true),
+                    traceFormatVersion = o.optInt("traceFormatVersion", 0),
+                    traceBaseTicks = o.optLong("traceBaseTicks", 0),
+                    traceFlags = o.optInt("traceFlags", 0),
+                    traceData = o.optString("traceData", ""),
+                    reviewedSplitNs = o.optLong("reviewedSplitNs", Long.MIN_VALUE)
+                        .takeUnless { it == Long.MIN_VALUE },
+                    reviewedStartOffsetTicks =
+                        o.optLong("reviewedStartOffsetTicks", Long.MIN_VALUE)
+                            .takeUnless { it == Long.MIN_VALUE },
+                    reviewedStopOffsetTicks =
+                        o.optLong("reviewedStopOffsetTicks", Long.MIN_VALUE)
+                            .takeUnless { it == Long.MIN_VALUE },
+                    reviewedAtMillis = o.optLong("reviewedAtMillis", -1L)
+                        .takeIf { it > 0 },
                     shotFolder = o.optString("shotFolder", ""),
                     thumbnailUri = o.optString("thumbnailUri", ""),
                 )
@@ -205,12 +235,20 @@ class ResultStore(context: Context, simulation: Boolean = false) {
                     .put("firmwareVersion", r.firmwareVersion)
                     .put("formatVersion", r.formatVersion)
                     .put("crcValid", r.crcValid)
+                    .put("traceFormatVersion", r.traceFormatVersion)
+                    .put("traceBaseTicks", r.traceBaseTicks)
+                    .put("traceFlags", r.traceFlags)
+                    .put("traceData", r.traceData)
                     .put("shotFolder", r.shotFolder)
                     .put("thumbnailUri", r.thumbnailUri)
                     .apply {
                         r.targetDistValue?.let { put("targetDistValue", it) }
                         r.manualVelocityMps?.let { put("manualVelocityMps", it) }
                         r.batteryMv?.let { put("batteryMv", it) }
+                        r.reviewedSplitNs?.let { put("reviewedSplitNs", it) }
+                        r.reviewedStartOffsetTicks?.let { put("reviewedStartOffsetTicks", it) }
+                        r.reviewedStopOffsetTicks?.let { put("reviewedStopOffsetTicks", it) }
+                        r.reviewedAtMillis?.let { put("reviewedAtMillis", it) }
                     }
             )
         }

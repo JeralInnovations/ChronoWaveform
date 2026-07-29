@@ -37,6 +37,7 @@ object Proto {
     val CAL: UUID = UUID.fromString("a5c40006-9d95-4e4c-8c5a-c1d6f2a80de1")
     val INFO: UUID = UUID.fromString("a5c40007-9d95-4e4c-8c5a-c1d6f2a80de1")
     val HEALTH: UUID = UUID.fromString("a5c40008-9d95-4e4c-8c5a-c1d6f2a80de1")
+    val TRACE: UUID = UUID.fromString("a5c40009-9d95-4e4c-8c5a-c1d6f2a80de1")
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     const val CMD_VERIFY1: Byte = 1
@@ -50,6 +51,9 @@ object Proto {
     const val CMD_HEALTH: Byte = 9
     const val CMD_IDENTIFY: Byte = 10
     const val CMD_ARM_OVERRIDE: Byte = 11
+    const val CMD_FETCH_TRACE: Byte = 12
+
+    const val CAP_EDGE_TRACE = 0x0008
 
     const val ST_IDLE = 0
     const val ST_VERIFY1 = 1
@@ -107,6 +111,20 @@ data class RawResult(
     val fwMinor: Int = 0,
     val formatVersion: Int = 1,
     val crcValid: Boolean = true,
+)
+
+data class TraceEdge(
+    val offsetTicks: Long,
+    val channel: Int,
+    val high: Boolean,
+)
+
+data class RawTrace(
+    val resultId: Int,
+    val formatVersion: Int,
+    val flags: Int,
+    val baseTicks: Long,
+    val events: List<TraceEdge>,
 )
 
 data class PortHealth(val flags: Int, val signatureNs: Long) {
@@ -195,6 +213,7 @@ class ChronoBle(private val context: Context) {
     val connState = MutableStateFlow(ConnState.DISCONNECTED)
     val status = MutableStateFlow<DeviceStatus?>(null)
     val results = MutableSharedFlow<RawResult>(extraBufferCapacity = 32)
+    val traces = MutableSharedFlow<RawTrace>(extraBufferCapacity = 16)
     val cal = MutableSharedFlow<CalReading>(extraBufferCapacity = 8)
     val hwInfo = MutableStateFlow<HwInfo?>(null)
     val health = MutableStateFlow<HealthStatus?>(null)
@@ -214,8 +233,20 @@ class ChronoBle(private val context: Context) {
     private var chCal: BluetoothGattCharacteristic? = null
     private var chInfo: BluetoothGattCharacteristic? = null
     private var chHealth: BluetoothGattCharacteristic? = null
+    private var chTrace: BluetoothGattCharacteristic? = null
     private var smoothedBatteryMv: Int? = null
     private var smoothedBatteryPercent: Int? = null
+
+    private data class TraceAssembly(
+        val formatVersion: Int,
+        val flags: Int,
+        val baseTicks: Long,
+        val chunkCount: Int,
+        val events: Array<TraceEdge?>,
+        val chunksReceived: BooleanArray,
+    )
+
+    private val traceAssemblies = mutableMapOf<Int, TraceAssembly>()
 
     val deviceStorageKey: String
         get() = if (isSimulation) "SIM-0001"
@@ -328,6 +359,7 @@ class ChronoBle(private val context: Context) {
     var simFault = SimFault.NONE
         private set
     private val simBufferedResults = mutableListOf<RawResult>()
+    private val simTraces = mutableMapOf<Int, RawTrace>()
 
     fun connectSimulated() {
         stopScan()
@@ -341,7 +373,8 @@ class ChronoBle(private val context: Context) {
         simTimeValid = false
         simBarePhase = true
         simBufferedResults.clear()
-        hwInfo.value = HwInfo(2, 2, 0, 62_500, 30, 300, "SIM-0001", 2, 1, 0x0007)
+        simTraces.clear()
+        hwInfo.value = HwInfo(2, 3, 0, 62_500, 30, 300, "SIM-0001", 2, 1, 0x000F)
         setSimFault(SimFault.NONE)
         pushSimStatus()
         connState.value = ConnState.CONNECTED
@@ -413,9 +446,11 @@ class ChronoBle(private val context: Context) {
             }
             Proto.CMD_ACK -> {
                 if (simPending > 0) simPending--
+                simTraces.remove(arg)
                 pushSimStatus()
             }
             Proto.CMD_FETCH -> flushSimBufferedResults()
+            Proto.CMD_FETCH_TRACE -> simTraces[arg]?.let { traces.tryEmit(it) }
             Proto.CMD_CALIBRATE -> simCalibrate(arg)
             Proto.CMD_HEALTH -> { setSimFault(simFault); pushSimStatus() }
             Proto.CMD_IDENTIFY -> Unit
@@ -502,7 +537,8 @@ class ChronoBle(private val context: Context) {
                 (if (split < 10_000L) Proto.RESULT_SPLIT_TOO_SHORT else 0)
             val result = RawResult(simNextId++, split, epoch, flags = flags,
                 startTicks = 1000, stopTicks = 1000 + split / 62, batteryMv = 3990,
-                bootId = 0x53494D31, hwRev = 2, fwMajor = 2, formatVersion = 2)
+                bootId = 0x53494D31, hwRev = 2, fwMajor = 3, formatVersion = 2)
+            simTraces[result.id] = simulatedTrace(result.id, split)
             if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
             else simBufferedResults.add(result)
             simState = Proto.ST_IDLE
@@ -515,8 +551,9 @@ class ChronoBle(private val context: Context) {
         simPending++
         val result = RawResult(simNextId++, 0, epoch, flags = flag,
             startTicks = if (flag == Proto.RESULT_STOP_TIMEOUT) 1000 else 0,
-            batteryMv = 3990, bootId = 0x53494D31, hwRev = 2, fwMajor = 2,
+            batteryMv = 3990, bootId = 0x53494D31, hwRev = 2, fwMajor = 3,
             formatVersion = 2)
+        simTraces[result.id] = simulatedTrace(result.id, 180_000L)
         if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
         else simBufferedResults.add(result)
         simState = Proto.ST_FAULT
@@ -529,6 +566,29 @@ class ChronoBle(private val context: Context) {
         simBufferedResults.clear()
         for (r in pending) results.tryEmit(r)
         pushSimStatus()
+    }
+
+    private fun simulatedTrace(resultId: Int, splitNs: Long): RawTrace {
+        val splitTicks = (splitNs * 16_000_000L / 1_000_000_000L).coerceAtLeast(2)
+        val impact1 = 12_000L
+        val impact2 = impact1 + splitTicks
+        val events = mutableListOf(
+            TraceEdge(0, 0, true),
+            TraceEdge(180, 0, false),
+            TraceEdge(splitTicks, 1, true),
+            TraceEdge(splitTicks + 170, 1, false),
+        )
+        repeat(10) { index ->
+            events += TraceEdge(impact1 + index * 260L, 0, index % 2 == 0)
+            events += TraceEdge(impact2 + index * 260L, 1, index % 2 == 0)
+        }
+        return RawTrace(
+            resultId = resultId,
+            formatVersion = 1,
+            flags = 0,
+            baseTicks = 1_000,
+            events = events.sortedBy { it.offsetTicks },
+        )
     }
 
     /** A split that yields a random, realistic muzzle velocity for the set gap. */
@@ -648,6 +708,7 @@ class ChronoBle(private val context: Context) {
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
                     synchronized(opLock) { opQueue.clear(); opInFlight = false }
+                    traceAssemblies.clear()
                     if (userDisconnected) {
                         g.close()
                         gatt = null
@@ -680,6 +741,7 @@ class ChronoBle(private val context: Context) {
             chCal = svc.getCharacteristic(Proto.CAL)    // optional (newer firmware)
             chInfo = svc.getCharacteristic(Proto.INFO)  // optional (newer firmware)
             chHealth = svc.getCharacteristic(Proto.HEALTH) // optional (protocol v2)
+            chTrace = svc.getCharacteristic(Proto.TRACE)   // optional waveform stream
             if (chStatus == null || chControl == null || chResult == null || chTime == null) {
                 g.disconnect()
                 return
@@ -688,6 +750,7 @@ class ChronoBle(private val context: Context) {
             enableNotifications(chResult!!)
             chCal?.let { enableNotifications(it) }
             chHealth?.let { enableNotifications(it) }
+            chTrace?.let { enableNotifications(it) }
             readStatus()
             readInfo()
             readHealth()
@@ -777,6 +840,72 @@ class ChronoBle(private val context: Context) {
                     )
                 } else {
                     results.tryEmit(RawResult(id, splitNs, epochSec, flags))
+                }
+            }
+            Proto.TRACE -> if (v.size >= 18) {
+                val payloadLength = v.size - 2
+                val packetCrc = (v[payloadLength].toInt() and 0xFF) or
+                    ((v[payloadLength + 1].toInt() and 0xFF) shl 8)
+                if (packetCrc != crc16Ccitt(v, payloadLength)) return
+
+                val resultId = (v[0].toInt() and 0xFF) or
+                    ((v[1].toInt() and 0xFF) shl 8)
+                val formatVersion = v[2].toInt() and 0xFF
+                val traceFlags = v[3].toInt() and 0xFF
+                val chunkIndex = v[4].toInt() and 0xFF
+                val chunkCount = v[5].toInt() and 0xFF
+                val eventCount = v[6].toInt() and 0xFF
+                val totalEvents = (v[8].toInt() and 0xFF) or
+                    ((v[9].toInt() and 0xFF) shl 8)
+                val eventStart = (v[10].toInt() and 0xFF) or
+                    ((v[11].toInt() and 0xFF) shl 8)
+                val baseTicks = (v[12].toLong() and 0xFF) or
+                    ((v[13].toLong() and 0xFF) shl 8) or
+                    ((v[14].toLong() and 0xFF) shl 16) or
+                    ((v[15].toLong() and 0xFF) shl 24)
+
+                if (chunkCount == 0 || chunkIndex >= chunkCount ||
+                    eventStart + eventCount > totalEvents ||
+                    v.size != 18 + eventCount * 4) return
+
+                val existing = traceAssemblies[resultId]
+                val assembly = if (existing == null ||
+                    existing.events.size != totalEvents ||
+                    existing.chunkCount != chunkCount
+                ) {
+                    TraceAssembly(
+                        formatVersion, traceFlags, baseTicks, chunkCount,
+                        arrayOfNulls(totalEvents), BooleanArray(chunkCount)
+                    ).also { traceAssemblies[resultId] = it }
+                } else existing
+
+                repeat(eventCount) { index ->
+                    val pos = 16 + index * 4
+                    val ticks = (v[pos].toLong() and 0xFF) or
+                        ((v[pos + 1].toLong() and 0xFF) shl 8) or
+                        ((v[pos + 2].toLong() and 0xFF) shl 16)
+                    val meta = v[pos + 3].toInt() and 0xFF
+                    assembly.events[eventStart + index] = TraceEdge(
+                        offsetTicks = ticks,
+                        channel = meta and 1,
+                        high = meta and 2 != 0,
+                    )
+                }
+                assembly.chunksReceived[chunkIndex] = true
+
+                if (assembly.chunksReceived.all { it } &&
+                    assembly.events.all { it != null }
+                ) {
+                    traces.tryEmit(
+                        RawTrace(
+                            resultId,
+                            assembly.formatVersion,
+                            assembly.flags,
+                            assembly.baseTicks,
+                            assembly.events.filterNotNull().sortedBy { it.offsetTicks },
+                        )
+                    )
+                    traceAssemblies.remove(resultId)
                 }
             }
             Proto.CAL -> if (v.size >= 20) {
