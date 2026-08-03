@@ -23,6 +23,7 @@ import com.chrono.app.data.ResultStore
 import com.chrono.app.data.SessionManager
 import com.chrono.app.data.TestResult
 import com.chrono.app.data.WaveformCodec
+import com.chrono.app.data.WaveformImageRenderer
 import com.chrono.app.data.ticksToNanoseconds
 import androidx.compose.runtime.mutableStateMapOf
 import kotlinx.coroutines.Job
@@ -41,7 +42,7 @@ import kotlin.math.abs
 import kotlin.math.pow
 import kotlin.math.sqrt
 
-enum class Screen { CONNECT, BASELINE, SENSOR1, SENSOR2, DISTANCE, DASHBOARD }
+enum class Screen { CONNECT, BASELINE, SENSOR1, SENSOR2, DISTANCE, DASHBOARD, SAVED_LOGS }
 
 enum class CalPhase { BARE, LOADED }
 
@@ -62,12 +63,15 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     val ble = ChronoBle(app)
     private val realStore = ResultStore(app, simulation = false)
     private val simStore = ResultStore(app, simulation = true)
-    private val store: ResultStore get() = if (ble.isSimulation) simStore else realStore
+    private var browsingRealLogs = false
+    private val store: ResultStore
+        get() = if (browsingRealLogs) realStore else if (ble.isSimulation) simStore else realStore
     private val prefs = app.getSharedPreferences("chrono", Application.MODE_PRIVATE)
     private val realSession = SessionManager(app, simulation = false)
     private val simSession = SessionManager(app, simulation = true)
     /** Active data sink; simulated runs are fully isolated from real ones. */
-    val session: SessionManager get() = if (ble.isSimulation) simSession else realSession
+    val session: SessionManager
+        get() = if (browsingRealLogs) realSession else if (ble.isSimulation) simSession else realSession
     private var projectRefreshJob: Job? = null
     private val mediaObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean) {
@@ -453,9 +457,12 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             ble.connState.collect { cs ->
                 when (cs) {
                     ConnState.CONNECTED -> {
+                        browsingRealLogs = false
                         setUiMode(if (ble.isSimulation) "sim" else "real")
                         loadDeviceReadiness()
                         reloadForMode()   // swap to this mode's isolated records
+                        newShots.clear()
+                        newShots.addAll(results.filter { !it.accepted })
                         routeFirstConnection(ble.status.value)
                     }
                     ConnState.DISCONNECTED ->
@@ -511,10 +518,39 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             .forEach(::add)
     }
 
-    fun dismissShotReview() {
-        val photoOwnerUid = newShots.lastOrNull()?.uid ?: results.firstOrNull()?.uid
+    fun acceptShotResult(uid: String? = newShots.lastOrNull()?.uid) {
+        uid ?: return
+        val index = results.indexOfFirst { it.uid == uid }
+        if (index >= 0) {
+            val accepted = results[index].copy(accepted = true)
+            results[index] = accepted
+            persist()
+            persistPublicResult(accepted)
+        }
+        val photoOwnerUid = uid
         newShots.clear()
         showPhotoPrompt("after", photoOwnerUid)
+    }
+
+    /** Discard only the false reading and restore the prepared, attached rig. */
+    fun falseTriggerReset(uid: String? = newShots.lastOrNull()?.uid) {
+        uid ?: return
+        val result = results.firstOrNull { it.uid == uid } ?: return
+        waveformRetryJobs.remove(uid)?.cancel()
+        pendingTraceUids.entries.removeAll { it.value == uid }
+        waveformTransferStatus.remove(uid)
+        ble.sendCommand(Proto.CMD_ACK, result.deviceResultId)
+        ble.sendCommand(Proto.CMD_DISARM)
+        if (result.shotFolder.isNotBlank()) session.discardShotArtifacts(result.shotFolder)
+        results.removeAll { it.uid == uid }
+        newShots.removeAll { it.uid == uid }
+        setupResultRecorded = false
+        prefs.edit().putBoolean(setupResultKey(), false).apply()
+        setSensorReady(1, true)
+        setSensorReady(2, true)
+        pendingLabel = result.label
+        persist()
+        photoRevision++
     }
 
     private fun onRawResult(r: RawResult) {
@@ -583,6 +619,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 firmwareVersion = if (r.fwMajor > 0) "${r.fwMajor}.${r.fwMinor}" else "",
                 formatVersion = r.formatVersion,
                 crcValid = r.crcValid,
+                accepted = false,
             )
             rec.shotFolder = session.logShot(rec.label, shotJson(rec))
             rec.thumbnailUri = session.listPhotos(rec.shotFolder).firstOrNull()?.toString() ?: ""
@@ -910,6 +947,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("epochMillis", r.epochMillis ?: -1L)
         .put("shotFolder", r.shotFolder)
         .put("thumbnailUri", r.thumbnailUri)
+        .put("accepted", r.accepted)
         .apply { r.targetDistValue?.let { put("targetDistValue", it) } }
 
     private fun waveformJson(r: TestResult): JSONObject {
@@ -963,7 +1001,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private fun persistPublicResult(r: TestResult) {
         if (r.shotFolder.isBlank()) return
         session.updateShot(r.shotFolder, shotJson(r))
-        if (r.hasWaveform) session.updateWaveform(r.shotFolder, waveformJson(r))
+        if (r.hasWaveform) {
+            session.updateWaveform(r.shotFolder, waveformJson(r))
+            val image = WaveformImageRenderer.renderPng(r, accuracyEnvelopePercentFor(r))
+            if (image.isNotEmpty()) session.updateWaveformImage(r.shotFolder, image)
+        }
     }
 
     fun deleteResult(uid: String) {
@@ -1414,8 +1456,34 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Manual logging without any chronograph — straight to the dashboard. */
     fun enterManualMode() {
+        browsingRealLogs = false
         setUiMode("manual")
         screen = Screen.DASHBOARD
+    }
+
+    /** Browse every real public result without requiring a Bluetooth session. */
+    fun enterSavedLogs() {
+        browsingRealLogs = true
+        setUiMode("saved_logs")
+        results.clear()
+        results.addAll(realSession.loadProjectResults())
+        realStore.save(results.toList())
+        val waveformImages = results.filter { it.hasWaveform && it.shotFolder.isNotBlank() }
+            .map { it to accuracyEnvelopePercentFor(it) }
+        viewModelScope.launch(Dispatchers.IO) {
+            waveformImages.forEach { (result, gae) ->
+                val image = WaveformImageRenderer.renderPng(result, gae)
+                if (image.isNotEmpty()) realSession.updateWaveformImage(result.shotFolder, image)
+            }
+        }
+        newShots.clear()
+        screen = Screen.SAVED_LOGS
+    }
+
+    fun exitSavedLogs() {
+        browsingRealLogs = false
+        setUiMode("")
+        screen = Screen.CONNECT
     }
 
     /** TopBar action: disconnect if connected, otherwise leave the dashboard. */
@@ -1443,6 +1511,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun connectSimulated() {
+        browsingRealLogs = false
         setUiMode("sim")
         ble.connectSimulated()
     }

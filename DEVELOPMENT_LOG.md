@@ -1,5 +1,7 @@
 # Development Log
 
+- 2026-08-02: Added explicit Accept Result / False Trigger - Reset handling that preserves the prepared test, offline browsing and waveform editing for every real public log, and a replaceable annotated `waveform.png` beside each waveform JSON file.
+
 - 2026-07-29: Added independent Rising/Falling edge selection for START and STOP, made waveform taps and previous/next controls follow the selected polarity, displayed both edge types on the graph, and reflowed narrow-screen action controls.
 - 2026-07-29: Made waveform preview/button taps open a dedicated full-screen review state, persisted every received/reviewed trace to both shot.json and adjacent waveform.json, and restored the app log from all public project folders.
 - 2026-07-29: Fixed missing waveform graphs by enabling the logger's large-MTU BLE mode before radio startup, retrying complete trace transfers, rejecting empty traces, showing transfer errors, and embedding a tappable graph directly in each result card.

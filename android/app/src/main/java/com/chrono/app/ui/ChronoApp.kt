@@ -39,7 +39,7 @@ fun ChronoApp(vm: ChronoViewModel) {
     }
 
     // New day (or first run): name a project folder, or keep the previous one.
-    if (vm.projectPrompt) {
+    if (vm.projectPrompt && vm.screen != Screen.SAVED_LOGS) {
         var name by remember { mutableStateOf(vm.defaultProjectName()) }
         val previous = vm.projectName
         AlertDialog(
@@ -95,5 +95,6 @@ fun ChronoApp(vm: ChronoViewModel) {
         )
         Screen.DISTANCE -> DistanceScreen(vm)
         Screen.DASHBOARD -> DashboardScreen(vm, connState, deviceStatus)
+        Screen.SAVED_LOGS -> SavedLogsScreen(vm)
     }
 }

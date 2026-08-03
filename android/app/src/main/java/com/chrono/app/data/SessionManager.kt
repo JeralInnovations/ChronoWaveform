@@ -200,6 +200,39 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         return writeJsonFile(rel, "waveform.json", json)
     }
 
+    /** Replace the human-readable waveform snapshot beside the JSON files. */
+    fun updateWaveformImage(rel: String, png: ByteArray): Boolean {
+        if (rel.isBlank()) return false
+        return writeBinaryFile(rel, "waveform.png", "image/png", png)
+    }
+
+    /**
+     * Remove only a provisional reading. Setup photos and the active test
+     * folder are deliberately retained so the operator can re-arm immediately.
+     */
+    fun discardShotArtifacts(rel: String): Boolean {
+        if (rel.isBlank()) return false
+        val artifactNames = setOf("shot.json", "waveform.json", "waveform.png")
+        val artifacts = projectFiles(allProjects = true).filter {
+            it.relativeFolder == rel && it.displayName in artifactNames
+        }
+        var success = true
+        artifacts.forEach { stored ->
+            val deleted = if (stored.uri != null) {
+                runCatching { context.contentResolver.delete(stored.uri, null, null) > 0 }
+                    .getOrDefault(false)
+            } else {
+                runCatching { stored.file?.delete() == true }.getOrDefault(false)
+            }
+            success = success && deleted
+        }
+        if (currentTestRel == rel) {
+            shotLogged = false
+            save()
+        }
+        return success
+    }
+
     /** Folder to attach photos to an existing record without touching counters. */
     fun folderForResult(existingRel: String?, uidHint: String): String {
         if (!existingRel.isNullOrBlank()) return existingRel
@@ -236,8 +269,9 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
                         "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.jpeg' OR " +
                         "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.png' OR " +
                         "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.webp' OR " +
-                        "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.heic')",
-                    arrayOf("Documents/$rootDir/$rel/"),
+                        "${MediaStore.MediaColumns.DISPLAY_NAME} LIKE '%.heic') AND " +
+                        "${MediaStore.MediaColumns.DISPLAY_NAME}!=?",
+                    arrayOf("Documents/$rootDir/$rel/", "waveform.png"),
                     "${MediaStore.MediaColumns._ID} ASC",
                 )?.use { c ->
                     val idc = c.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
@@ -247,7 +281,9 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
             out
         } else {
             val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "$rootDir/$rel")
-            dir.listFiles { f -> f.extension.lowercase() in setOf("jpg", "jpeg", "png") }
+            dir.listFiles { f ->
+                f.name != "waveform.png" && f.extension.lowercase() in setOf("jpg", "jpeg", "png")
+            }
                 ?.sortedBy { it.name }
                 ?.mapNotNull {
                     runCatching {
@@ -449,7 +485,15 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
     }
 
     private fun writeJsonFile(rel: String, name: String, json: JSONObject): Boolean {
-        val bytes = json.toString(2).toByteArray()
+        return writeBinaryFile(rel, name, "application/json", json.toString(2).toByteArray())
+    }
+
+    private fun writeBinaryFile(
+        rel: String,
+        name: String,
+        mime: String,
+        bytes: ByteArray,
+    ): Boolean {
         if (!useMediaStore) {
             val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "$rootDir/$rel")
             return runCatching {
@@ -459,7 +503,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         }
 
         val uri = findUriAt(rel, name)
-            ?: createUriAt(rel, name, "application/json")
+            ?: createUriAt(rel, name, mime)
             ?: return false
         return runCatching {
             context.contentResolver.openOutputStream(uri, "wt")!!.use { it.write(bytes) }

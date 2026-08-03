@@ -467,8 +467,9 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
         }
         val waitingForWaveform = waitingWaveformShot != null
         val waveformStatus = waitingWaveformShot?.let { vm.waveformStatusFor(it.uid) }
+        val pendingShot = vm.newShots.last()
         AlertDialog(
-            onDismissRequest = { vm.dismissShotReview() },
+            onDismissRequest = { },
             title = {
                 Text(if (vm.newShots.size == 1) "Shot recorded" else "${vm.newShots.size} shots received")
             },
@@ -476,7 +477,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 Column {
                     for (s in vm.newShots) {
                         Text(
-                            "AUTOMATIC SPEED ESTIMATE",
+                            if (s.isWaveformReviewed) "REVIEWED SPEED" else "AUTOMATIC SPEED ESTIMATE",
                             style = MaterialTheme.typography.labelSmall,
                             color = TextDim,
                         )
@@ -557,29 +558,40 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 }
             },
             confirmButton = {
-                if (waveformShot != null) {
-                    TextButton(onClick = { waveformReviewResult = waveformShot }) {
-                        Text("Select START / STOP")
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    if (waveformShot != null) {
+                        OutlinedButton(
+                            onClick = { waveformReviewResult = waveformShot },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Select START / STOP")
+                        }
+                    } else if (waitingForWaveform) {
+                        OutlinedButton(
+                            onClick = { vm.requestWaveform(pendingShot.uid) },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("Retry waveform")
+                        }
                     }
-                } else {
-                    TextButton(
-                        onClick = {
-                            if (waitingWaveformShot != null) {
-                                vm.requestWaveform(waitingWaveformShot.uid)
-                            } else {
-                                vm.dismissShotReview()
-                            }
-                        },
-                    ) { Text(if (waitingForWaveform) "Retry waveform" else "Continue") }
+                    OutlinedButton(
+                        onClick = { vm.falseTriggerReset(pendingShot.uid) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("False Trigger - Reset", color = Bad)
+                    }
+                    Button(
+                        onClick = { vm.acceptShotResult(pendingShot.uid) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Accept result")
+                    }
                 }
             },
-            dismissButton = {
-                if (waveformShot != null || waitingForWaveform) {
-                    TextButton(onClick = { vm.dismissShotReview() }) {
-                        Text(if (waitingForWaveform) "Continue without waveform" else "Use automatic")
-                    }
-                }
-            },
+            dismissButton = { },
         )
     }
 
@@ -704,7 +716,6 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             onApply = { start, stop ->
                 vm.applyReviewedTiming(result.uid, start, stop)
                 waveformReviewResult = null
-                if (vm.newShots.any { it.uid == result.uid }) vm.dismissShotReview()
             },
             onReset = { vm.resetReviewedTiming(result.uid) },
         )
@@ -935,13 +946,89 @@ private fun PhotoThumbnail(
 }
 
 @Composable
+fun SavedLogsScreen(vm: ChronoViewModel) {
+    var editing by remember { mutableStateOf<TestResult?>(null) }
+    var waveform by remember { mutableStateOf<TestResult?>(null) }
+    var fullscreenPhoto by remember {
+        mutableStateOf<Pair<android.net.Uri, String>?>(null)
+    }
+
+    if (editing == null && waveform == null && fullscreenPhoto == null) {
+        FullLogDialog(
+            vm = vm,
+            title = "Saved real tests",
+            onExit = { vm.exitSavedLogs() },
+            onEdit = { editing = it },
+            onOpenPhoto = { uri, uid -> fullscreenPhoto = uri to uid },
+            onReviewWaveform = { waveform = it },
+            onFetchWaveform = null,
+        )
+    }
+
+    editing?.let { r ->
+        EditResultDialog(
+            result = r,
+            photoRevision = vm.photoRevision,
+            onDismiss = { editing = null },
+            onSave = { label, shotType, tool, target, tdVal, tdUnit, loading, projectile, passFail, notes, epochMillis ->
+                vm.updateResult(
+                    r.uid, label, shotType, tool, loading, projectile, target, tdVal, tdUnit,
+                    passFail, notes, epochMillis,
+                )
+                editing = null
+            },
+            onAttachPhotos = { uris -> vm.attachPhotosToResult(r.uid, uris) },
+            photosFor = { vm.photosFor(r) },
+            onOpenPhoto = { fullscreenPhoto = it to r.uid },
+            onDeletePhoto = { uri -> vm.deleteResultPhoto(r.uid, uri) },
+            onDelete = {
+                vm.deleteResult(r.uid)
+                editing = null
+            },
+        )
+    }
+
+    waveform?.let { selected ->
+        val current = vm.results.firstOrNull { it.uid == selected.uid } ?: selected
+        WaveformReviewDialog(
+            result = current,
+            accuracyEnvelopePercentForSplit = { splitNs ->
+                vm.accuracyEnvelopePercentForSelection(current, splitNs)
+            },
+            onDismiss = { waveform = null },
+            onApply = { start, stop ->
+                vm.applyReviewedTiming(current.uid, start, stop)
+                waveform = null
+            },
+            onReset = { vm.resetReviewedTiming(current.uid) },
+        )
+    }
+
+    fullscreenPhoto?.let { (uri, _) ->
+        Dialog(
+            onDismissRequest = { fullscreenPhoto = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false),
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize().background(Color.Black.copy(alpha = .96f))
+                    .clickable { fullscreenPhoto = null },
+                contentAlignment = Alignment.Center,
+            ) {
+                AsyncImage(model = uri, contentDescription = null, modifier = Modifier.fillMaxWidth())
+            }
+        }
+    }
+}
+
+@Composable
 private fun FullLogDialog(
     vm: ChronoViewModel,
+    title: String = "Test log",
     onExit: () -> Unit,
     onEdit: (TestResult) -> Unit,
     onOpenPhoto: (android.net.Uri, String) -> Unit,
     onReviewWaveform: (TestResult) -> Unit,
-    onFetchWaveform: (TestResult) -> Unit,
+    onFetchWaveform: ((TestResult) -> Unit)?,
 ) {
     val photoRevision = vm.photoRevision
     Dialog(
@@ -956,7 +1043,7 @@ private fun FullLogDialog(
         ) {
             Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.weight(1f)) {
-                    Text("Test log", style = MaterialTheme.typography.headlineMedium, color = Amber)
+                    Text(title, style = MaterialTheme.typography.headlineMedium, color = Amber)
                     Text(
                         "${vm.results.size} result${if (vm.results.size == 1) "" else "s"}",
                         style = MaterialTheme.typography.bodyMedium,
@@ -965,8 +1052,21 @@ private fun FullLogDialog(
                 }
                 TextButton(onClick = onExit) { Text("Exit") }
             }
-            Spacer(Modifier.height(12.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { vm.refreshProjectData() }) { Text("Refresh") }
+                TextButton(onClick = { vm.openDataFolder() }) { Text("Open files") }
+            }
+            Spacer(Modifier.height(6.dp))
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (vm.results.isEmpty()) {
+                    item {
+                        Text(
+                            "No real test folders with shot.json were found in ChronoData.",
+                            color = TextDim,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
+                }
                 items(vm.results, key = { it.uid }) { r ->
                     Column {
                         ResultCard(
@@ -978,7 +1078,7 @@ private fun FullLogDialog(
                             onEdit = { onEdit(r) },
                             onOpenPhoto = { onOpenPhoto(it, r.uid) },
                             onReviewWaveform = { onReviewWaveform(r) },
-                            onFetchWaveform = { onFetchWaveform(r) },
+                            onFetchWaveform = onFetchWaveform?.let { fetch -> { fetch(r) } },
                             waveformStatus = vm.waveformStatusFor(r.uid),
                         )
                         val photos = vm.photosFor(r)

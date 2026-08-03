@@ -63,6 +63,8 @@ data class TestResult(
     var shotFolder: String = "",
     /** user-chosen cover image URI for this shot ("" = use the first photo) */
     var thumbnailUri: String = "",
+    /** New device readings remain provisional until the operator accepts them. */
+    var accepted: Boolean = true,
 ) {
     val isManual: Boolean get() = deviceResultId < 0
     val isReversed: Boolean get() = resultFlags and 0x04 != 0 && splitNs > 0
@@ -213,6 +215,7 @@ internal fun testResultFromJson(
         measurementErrorUnit = o.optString("measurementErrorUnit", "INCHES"),
         shotFolder = folder.ifBlank { o.optString("shotFolder", "") },
         thumbnailUri = o.optString("thumbnailUri", ""),
+        accepted = o.optBoolean("accepted", true),
     )
 }
 
@@ -271,6 +274,7 @@ class ResultStore(context: Context, simulation: Boolean = false) {
                     .put("measurementErrorUnit", r.measurementErrorUnit)
                     .put("shotFolder", r.shotFolder)
                     .put("thumbnailUri", r.thumbnailUri)
+                    .put("accepted", r.accepted)
                     .apply {
                         r.targetDistValue?.let { put("targetDistValue", it) }
                         r.manualVelocityMps?.let { put("manualVelocityMps", it) }

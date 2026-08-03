@@ -20,6 +20,7 @@ import androidx.compose.material.icons.filled.Bluetooth
 import androidx.compose.material.icons.filled.BluetoothSearching
 import androidx.compose.material.icons.filled.EditNote
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.PlayCircleOutline
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -210,6 +211,18 @@ fun ConnectScreen(vm: ChronoViewModel, connState: ConnState) {
             )
             Spacer(Modifier.size(8.dp))
             Text("Manual logging (no chrono)", color = TextDim, maxLines = 1)
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = { vm.enterSavedLogs() },
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Icon(
+                Icons.Filled.FolderOpen, null,
+                tint = TextDim, modifier = Modifier.size(18.dp),
+            )
+            Spacer(Modifier.size(8.dp))
+            Text("Review saved real tests", color = TextDim, maxLines = 1)
         }
     }
 
