@@ -1,6 +1,7 @@
 package com.chrono.app.data
 
 import android.content.Context
+import android.util.AtomicFile
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -219,73 +220,89 @@ internal fun testResultFromJson(
     )
 }
 
-/** Private recovery cache; public project folders are the displayed source. */
+/** Durable local library. Public project files are portable copies, not the database. */
 class ResultStore(context: Context, simulation: Boolean = false) {
     // Simulated runs persist to their own file so demo data never mixes with
     // real results.
     private val file = File(context.filesDir, if (simulation) "results_sim.json" else "results.json")
 
+    private val atomic = AtomicFile(file)
+    private var unreadable = false
+
+    @Synchronized
     fun load(): List<TestResult> {
-        if (!file.exists()) return emptyList()
+        if (!file.exists() && !File(file.path + ".bak").exists()) return emptyList()
         return runCatching {
-            val arr = JSONArray(file.readText())
+            val arr = JSONArray(atomic.openRead().bufferedReader().use { it.readText() })
             (0 until arr.length()).map { i ->
                 testResultFromJson(arr.getJSONObject(i))
             }
-        }.getOrDefault(emptyList())
+        }.onFailure { unreadable = true }.getOrDefault(emptyList())
     }
 
-    fun save(results: List<TestResult>) {
-        val arr = JSONArray()
-        for (r in results) {
-            arr.put(
-                JSONObject()
-                    .put("uid", r.uid)
-                    .put("deviceResultId", r.deviceResultId)
-                    .put("splitNs", r.splitNs)
-                    .put("distanceM", r.distanceM)
-                    .put("label", r.label)
-                    .put("epochMillis", r.epochMillis ?: -1L)
-                    .put("tool", r.tool)
-                    .put("shotType", r.shotType.ifBlank { "Standard" })
-                    .put("disruptorLoading", r.disruptorLoading)
-                    .put("projectileType", r.projectileType.ifBlank { "Water" })
-                    .put("targetDistUnit", r.targetDistUnit)
-                    .put("target", r.target)
-                    .put("passFail", r.passFail)
-                    .put("specialNotes", r.specialNotes)
-                    .put("outcome", r.specialNotes.ifBlank { r.outcome })
-                    .put("deviceSerial", r.deviceSerial)
-                    .put("resultFlags", r.resultFlags)
-                    .put("rawStartTicks", r.rawStartTicks)
-                    .put("rawStopTicks", r.rawStopTicks)
-                    .put("portFlags", r.portFlags)
-                    .put("bootId", r.bootId)
-                    .put("resetCause", r.resetCause)
-                    .put("hardwareRevision", r.hardwareRevision)
-                    .put("firmwareVersion", r.firmwareVersion)
-                    .put("formatVersion", r.formatVersion)
-                    .put("crcValid", r.crcValid)
-                    .put("traceFormatVersion", r.traceFormatVersion)
-                    .put("traceBaseTicks", r.traceBaseTicks)
-                    .put("traceFlags", r.traceFlags)
-                    .put("traceData", r.traceData)
-                    .put("measurementErrorM", r.measurementErrorM)
-                    .put("measurementErrorUnit", r.measurementErrorUnit)
-                    .put("shotFolder", r.shotFolder)
-                    .put("thumbnailUri", r.thumbnailUri)
-                    .put("accepted", r.accepted)
-                    .apply {
-                        r.targetDistValue?.let { put("targetDistValue", it) }
-                        r.manualVelocityMps?.let { put("manualVelocityMps", it) }
-                        r.batteryMv?.let { put("batteryMv", it) }
-                        r.reviewedSplitNs?.let { put("reviewedSplitNs", it) }
-                        r.reviewedStartOffsetTicks?.let { put("reviewedStartOffsetTicks", it) }
-                        r.reviewedStopOffsetTicks?.let { put("reviewedStopOffsetTicks", it) }
-                        r.reviewedAtMillis?.let { put("reviewedAtMillis", it) }
-                    }
-            )
-        }
-        file.writeText(arr.toString())
+    @Synchronized
+    fun save(results: List<TestResult>): Boolean {
+        if (unreadable) return false
+        return runCatching {
+            val arr = JSONArray()
+            results.forEach { arr.put(testResultToJson(it)) }
+            val output = atomic.startWrite()
+            try {
+                output.write(arr.toString().toByteArray(Charsets.UTF_8))
+                output.fd.sync()
+                atomic.finishWrite(output)
+            } catch (error: Exception) {
+                atomic.failWrite(output)
+                throw error
+            }
+        }.isSuccess
     }
 }
+
+/** Lossless representation shared by the library and portable JSON exports. */
+internal fun testResultToJson(r: TestResult): JSONObject =
+    JSONObject()
+        .put("uid", r.uid)
+        .put("deviceResultId", r.deviceResultId)
+        .put("splitNs", r.splitNs)
+        .put("distanceM", r.distanceM)
+        .put("label", r.label)
+        .put("epochMillis", r.epochMillis ?: -1L)
+        .put("tool", r.tool)
+        .put("shotType", r.shotType.ifBlank { "Standard" })
+        .put("disruptorLoading", r.disruptorLoading)
+        .put("projectileType", r.projectileType.ifBlank { "Water" })
+        .put("targetDistUnit", r.targetDistUnit)
+        .put("target", r.target)
+        .put("passFail", r.passFail)
+        .put("specialNotes", r.specialNotes)
+        .put("outcome", r.specialNotes.ifBlank { r.outcome })
+        .put("deviceSerial", r.deviceSerial)
+        .put("resultFlags", r.resultFlags)
+        .put("rawStartTicks", r.rawStartTicks)
+        .put("rawStopTicks", r.rawStopTicks)
+        .put("portFlags", r.portFlags)
+        .put("bootId", r.bootId)
+        .put("resetCause", r.resetCause)
+        .put("hardwareRevision", r.hardwareRevision)
+        .put("firmwareVersion", r.firmwareVersion)
+        .put("formatVersion", r.formatVersion)
+        .put("crcValid", r.crcValid)
+        .put("traceFormatVersion", r.traceFormatVersion)
+        .put("traceBaseTicks", r.traceBaseTicks)
+        .put("traceFlags", r.traceFlags)
+        .put("traceData", r.traceData)
+        .put("measurementErrorM", r.measurementErrorM)
+        .put("measurementErrorUnit", r.measurementErrorUnit)
+        .put("shotFolder", r.shotFolder)
+        .put("thumbnailUri", r.thumbnailUri)
+        .put("accepted", r.accepted)
+        .apply {
+            r.targetDistValue?.let { put("targetDistValue", it) }
+            r.manualVelocityMps?.let { put("manualVelocityMps", it) }
+            r.batteryMv?.let { put("batteryMv", it) }
+            r.reviewedSplitNs?.let { put("reviewedSplitNs", it) }
+            r.reviewedStartOffsetTicks?.let { put("reviewedStartOffsetTicks", it) }
+            r.reviewedStopOffsetTicks?.let { put("reviewedStopOffsetTicks", it) }
+            r.reviewedAtMillis?.let { put("reviewedAtMillis", it) }
+        }

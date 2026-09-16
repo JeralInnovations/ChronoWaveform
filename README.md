@@ -1,5 +1,11 @@
 # Chrono Waveform — Reviewable BLE Chronograph
 
+**Storage reliability update (2.2.0 app / 3.3 firmware):** New recordings have
+permanent unique folders, labels no longer rename folders, saved history survives
+partial folder scans, and the log supports search, project filters and JSON
+export/import. Read [Storage and safe updates](docs/STORAGE_AND_UPDATES.md) before
+replacing an older APK, especially if Android asks you to uninstall it first.
+
 A two-sensor chronograph with dedicated builds for the **nice!nano v2** and
 the economical **Seeed Studio XIAO nRF52840 PTH board**, controlled by a native
 **Android app** over Bluetooth Low Energy.
@@ -204,7 +210,8 @@ tab). To install it, on your phone's browser:
 
 1. Open the repo's **Releases** page:
    `https://github.com/JeralInnovations/ChronoWaveform/releases`
-2. Under **Latest app build**, download `app-debug.apk`.
+2. Under **Latest signed app build**, download `app-release.apk` once persistent signing is configured.
+   For migration from the older `app-debug.apk`, first read [Storage and safe updates](docs/STORAGE_AND_UPDATES.md).
 3. Open the downloaded file. Android will warn about installing unknown apps —
    allow it for your browser when prompted, then tap *Install*.
 
@@ -271,11 +278,11 @@ public storage under **`Documents/ChronoData/<project>/<test>/`** — browsable
 in any file manager. The **project** folder is per day, named by date (you can
 rename it when it's created); a **new day** prompts you to start a new project
 or keep logging into the previous one — it does *not* prompt after every shot.
-Each **test** is a subfolder named by that shot's label (or `Test1`, `Test2`…
-auto-incrementing from the folders already present), holding `shot.json` plus
-the shot's photos. The public folders are authoritative: the app rescans them
-when it resumes and when Android reports a file change, so valid outside edits
-to `shot.json`, folder renames, and manually added images appear in the app.
+Each **test** has a permanent subfolder named `Label--<UUID>`, holding `shot.json` plus
+the shot's photos. The private library is authoritative; public folders are
+portable copies. Refresh discovers previously unseen recordings without removing
+saved history or reverting edits. Edit labels and metadata in the app. Use Import
+to recover old JSON files that Android no longer exposes automatically.
 Tap the folder path at the top of the dashboard (or the *Files* button
 above the results) to open it. After setup the app prompts for **setup photos**
 of the rig; after each shot you first get a **results screen**, then the
@@ -297,9 +304,9 @@ every result (label, date, split, distance, velocities) plus the raw
 calibration history (`.jsonl`) through Android's share sheet — email it,
 save to Drive, etc.
 
-Saving changes in a result's **Edit** dialog renames that test folder when its
-label changes and updates the folder's canonical `shot.json`; it does not
-create a second JSON file.
+Saving changes in a result's **Edit** dialog updates its label and canonical
+`shot.json` without renaming the owning folder. New folders include a permanent
+UUID, so repeated labels never identify the same recording.
 
 **Hardware identification & accuracy.** The device reports its hardware
 revision and timing spec (timer tick, crystal tolerance, front-end jitter)
@@ -315,9 +322,9 @@ disables ARM. Fit fresh wire, tap the torn sensor in the diagram to retest it �
 the app re-verifies the trigger and automatically re-measures the new screen's
 electrical load before the next shot can be armed.
 
-Only one result is accepted per completed setup. Repeated BLE delivery is
-deduplicated by logger boot ID plus result ID, and the setup does not reopen for
-another result until both channels have been restored to Ready.
+Repeated BLE delivery is deduplicated by logger identity, boot ID and result ID.
+Every distinct retained result is saved when reconnecting. Both channels still
+need to be restored to Ready before the next setup is armed.
 5. **Dashboard** — from here you can:
    - **Retest 1 / Retest 2** — re-run either sensor test any time
    - **Change** — edit the sensor spacing

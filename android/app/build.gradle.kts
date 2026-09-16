@@ -12,13 +12,27 @@ android {
         applicationId = "com.chrono.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 8
-        versionName = "2.1.4-waveform"
+        versionCode = 9
+        versionName = "2.2.0-storage"
+    }
+
+    val keystorePath = System.getenv("CHRONO_KEYSTORE_FILE")
+    if (!keystorePath.isNullOrBlank()) {
+        signingConfigs.create("persistentRelease") {
+            storeFile = file(keystorePath)
+            storePassword = System.getenv("CHRONO_KEYSTORE_PASSWORD")
+            keyAlias = System.getenv("CHRONO_KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "chrono"
+            keyPassword = System.getenv("CHRONO_KEY_PASSWORD")?.takeIf { it.isNotBlank() }
+                ?: System.getenv("CHRONO_KEYSTORE_PASSWORD")
+        }
     }
 
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (!keystorePath.isNullOrBlank()) {
+                signingConfig = signingConfigs.getByName("persistentRelease")
+            }
         }
     }
 
@@ -32,9 +46,14 @@ android {
     buildFeatures {
         compose = true
     }
+    testOptions {
+        unitTests.isIncludeAndroidResources = true
+    }
 }
 
 dependencies {
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
     implementation(platform("androidx.compose:compose-bom:2024.12.01"))
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.activity:activity-compose:1.9.3")

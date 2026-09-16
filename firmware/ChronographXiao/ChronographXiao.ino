@@ -245,7 +245,7 @@ struct __attribute__((packed)) CalResult {
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
 const uint8_t FW_MAJOR = 3;
-const uint8_t FW_MINOR = 2;
+const uint8_t FW_MINOR = 3;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -339,7 +339,8 @@ const uint32_t STOP_TIMEOUT_MS = 1000UL;
 
 // ACK ids are queued here from the BLE callback and applied in loop(), so
 // the pending[] buffer is only ever mutated from one context.
-volatile uint16_t ackQueue[MAX_PENDING];
+const uint8_t ACK_QUEUE_SIZE = MAX_PENDING + 1;
+volatile uint16_t ackQueue[ACK_QUEUE_SIZE];
 volatile uint8_t  ackHead = 0, ackTail = 0;
 uint32_t lastBatteryNotifyMs = 0;
 uint16_t filteredBatteryMv = 0;
@@ -892,12 +893,11 @@ void notifyTraceById(uint16_t id) {
 }
 
 void storeResult(uint32_t splitNs, uint8_t flags, uint32_t startTicks, uint32_t stopTicks) {
-  if (pendingCount >= MAX_PENDING) {           // buffer full: drop the oldest
-    memmove(&pending[0], &pending[1], sizeof(pending[0]) * (MAX_PENDING - 1));
-    pendingCount = MAX_PENDING - 1;
-  }
+  // beginArm reserves capacity. Never overwrite an unacknowledged capture.
+  if (pendingCount >= MAX_PENDING) return;
   Pending& p = pending[pendingCount++];
   p.id      = nextId++;
+  if (nextId == 0) nextId = 1; // zero is the no-trace-request sentinel
   p.splitNs = splitNs;
   p.bootMs  = millis();                        // flywheel timestamp
   p.flags = flags;
@@ -950,6 +950,7 @@ void finishCapturedPair() {
 }
 
 void beginArm(bool overrideFaults) {
+  if (pendingCount >= MAX_PENDING) { setState(ST_FAULT); return; }
   bool healthy = performHealthCheck();
   activeResultFlags = overrideFaults ? RESULT_ARM_OVERRIDE : 0;
   if (!healthy) activeResultFlags |= RESULT_PORT_WARNING;
@@ -1112,7 +1113,7 @@ void onControlWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, ui
       break;
     case CMD_ACK: {
       // Defer the buffer edit to loop() — never mutate pending[] here.
-      uint8_t nt = (uint8_t)((ackTail + 1) % MAX_PENDING);
+      uint8_t nt = (uint8_t)((ackTail + 1) % ACK_QUEUE_SIZE);
       if (nt != ackHead) { ackQueue[ackTail] = arg; ackTail = nt; }
       break;
     }
@@ -1306,7 +1307,7 @@ void loop() {
   bool acked = false;
   while (ackHead != ackTail) {
     uint16_t id = ackQueue[ackHead];
-    ackHead = (uint8_t)((ackHead + 1) % MAX_PENDING);
+    ackHead = (uint8_t)((ackHead + 1) % ACK_QUEUE_SIZE);
     ackResult(id);
     acked = true;
   }

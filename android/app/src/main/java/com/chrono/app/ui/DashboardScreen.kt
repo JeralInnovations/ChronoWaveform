@@ -181,6 +181,9 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
         if (connState == ConnState.RECONNECTING) {
             item { ReconnectingBanner() }
         }
+        if ((deviceStatus?.pendingCount ?: 0) >= 16) {
+            item { Text("Logger storage is full. Keep connected to finish saving pending tests before arming again.", color = Amber) }
+        }
 
         if (!offline) {
             item {
@@ -274,8 +277,8 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 ArmButton(
                     armed = armed,
                     running = running,
-                    connected = (connState == ConnState.CONNECTED || connState == ConnState.RECONNECTING) &&
-                        state != Proto.ST_CHECKING,
+                    connected = connState == ConnState.CONNECTED &&
+                        state != Proto.ST_CHECKING && (deviceStatus?.pendingCount ?: 16) < 16,
                     sensorsReady = vm.sensor1Ready && vm.sensor2Ready,
                     onArm = { vm.arm() },
                     onDisarm = { vm.disarm() },
@@ -1031,6 +1034,17 @@ private fun FullLogDialog(
     onFetchWaveform: ((TestResult) -> Unit)?,
 ) {
     val photoRevision = vm.photoRevision
+    val context = LocalContext.current
+    val importFiles = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { vm.importReadings(it) }
+    var query by remember { mutableStateOf("") }
+    var project by remember { mutableStateOf<String?>(null) }
+    var projectMenu by remember { mutableStateOf(false) }
+    val projects = vm.results.map { it.shotFolder.substringBefore('/') }.filter { it.isNotBlank() }.distinct().sorted()
+    val visible = vm.results.filter { result ->
+        (project == null || result.shotFolder.substringBefore('/') == project) &&
+            (query.isBlank() || listOf(result.label, result.tool, result.target, result.specialNotes,
+                result.shotFolder, result.formattedDate().orEmpty()).any { it.contains(query.trim(), ignoreCase = true) })
+    }
     Dialog(
         onDismissRequest = onExit,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -1045,7 +1059,7 @@ private fun FullLogDialog(
                 Column(Modifier.weight(1f)) {
                     Text(title, style = MaterialTheme.typography.headlineMedium, color = Amber)
                     Text(
-                        "${vm.results.size} result${if (vm.results.size == 1) "" else "s"}",
+                        "${visible.size} of ${vm.results.size} results",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextDim,
                     )
@@ -1053,21 +1067,44 @@ private fun FullLogDialog(
                 TextButton(onClick = onExit) { Text("Exit") }
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { importFiles.launch("application/json") }) { Text("Import") }
                 TextButton(onClick = { vm.refreshProjectData() }) { Text("Refresh") }
                 TextButton(onClick = { vm.openDataFolder() }) { Text("Open files") }
             }
+            vm.importMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextDim) }
+            OutlinedTextField(
+                value = query, onValueChange = { query = it },
+                label = { Text("Search label, tool, target or notes") },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box {
+                    TextButton(onClick = { projectMenu = true }) { Text(project ?: "All projects") }
+                    DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
+                        DropdownMenuItem(text = { Text("All projects") }, onClick = { project = null; projectMenu = false })
+                        projects.forEach { name ->
+                            DropdownMenuItem(text = { Text(name) }, onClick = { project = name; projectMenu = false })
+                        }
+                    }
+                }
+                TextButton(enabled = visible.isNotEmpty(), onClick = { Exporter.export(context, visible, vm.isSimulation) }) {
+                    Text("Export shown")
+                }
+            }
+            Text("Saved on this phone ; public copies in ${vm.session.pathLabel}",
+                style = MaterialTheme.typography.bodySmall, color = TextDim)
             Spacer(Modifier.height(6.dp))
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (vm.results.isEmpty()) {
+                if (visible.isEmpty()) {
                     item {
                         Text(
-                            "No real test folders with shot.json were found in ChronoData.",
+                            if (vm.results.isEmpty()) "No saved tests yet. Record a test or add a manual entry." else "No matching tests. Clear the search or choose All projects.",
                             color = TextDim,
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }
                 }
-                items(vm.results, key = { it.uid }) { r ->
+                items(visible, key = { it.uid }) { r ->
                     Column {
                         ResultCard(
                             r = r,

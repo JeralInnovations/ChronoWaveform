@@ -20,6 +20,9 @@ import com.chrono.app.ble.RawTrace
 import android.net.Uri
 import com.chrono.app.data.DistanceUnit
 import com.chrono.app.data.ResultStore
+import com.chrono.app.data.recoverResults
+import com.chrono.app.data.testResultFromJson
+import org.json.JSONArray
 import com.chrono.app.data.SessionManager
 import com.chrono.app.data.TestResult
 import com.chrono.app.data.WaveformCodec
@@ -87,6 +90,57 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private var resetReadinessThisLaunch = true
 
     val results = mutableStateListOf<TestResult>()
+    var storageMessage by mutableStateOf<String?>(null)
+        private set
+
+    fun retryStorage() {
+        if (persist()) {
+            storageMessage = null
+            results.toList().forEach(::persistPublicResult)
+            if (ble.connState.value == ConnState.CONNECTED) ble.sendCommand(Proto.CMD_FETCH)
+        }
+    }
+
+    var importMessage by mutableStateOf<String?>(null)
+        private set
+
+    fun importReadings(uris: List<Uri>) {
+        val destination = session
+        viewModelScope.launch {
+            val imported = withContext(Dispatchers.IO) {
+                runCatching {
+                    uris.flatMap { uri ->
+                        val text = getApplication<Application>().contentResolver.openInputStream(uri)
+                            ?.bufferedReader()?.use { it.readText() } ?: error("Cannot open selected file")
+                        val array = if (text.trimStart().startsWith("[")) JSONArray(text)
+                            else JSONArray().put(JSONObject(text))
+                        (0 until array.length()).map { index ->
+                            val json = array.getJSONObject(index)
+                            require(json.has("splitNs") || json.has("manualVelocityMps")) { "Not a Chrono reading" }
+                            val record = testResultFromJson(json)
+                            val safeId = UUID.nameUUIDFromBytes(record.uid.toByteArray()).toString()
+                            record.copy(shotFolder = "Imported/$safeId", thumbnailUri = "")
+                        }
+                    }
+                }
+            }
+            if (session !== destination) return@launch
+            imported.fold(onSuccess = { records ->
+                val additions = records.distinctBy { it.uid }.filter { record -> results.none { it.uid == record.uid } }
+                val before = results.toList()
+                results.addAll(additions)
+                if (persist()) {
+                    additions.forEach(::persistPublicResult)
+                    importMessage = "Imported ${additions.size} readings. Existing readings were kept. Photos stay in their original folders."
+                } else {
+                    results.clear(); results.addAll(before)
+                }
+            }, onFailure = { importMessage = "Import failed. Choose a Chrono readings JSON export or a saved shot.json file." })
+        }
+    }
+
+    fun dismissStorageMessage() { storageMessage = null }
+
 
     /** Details applied to the next test; all editable on the result afterwards.
      *  Shot setup fields persist across sessions (they rarely change mid-range-day). */
@@ -409,6 +463,17 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private var pendingCal: Pair<Int, CalPhase>? = null
     private var calTimeoutJob: Job? = null
 
+    val newShots = mutableStateListOf<TestResult>()
+    private val pendingTraceUids = mutableMapOf<Int, String>()
+    private val waveformTransferStatus = mutableStateMapOf<String, String>()
+    private val waveformRetryJobs = mutableMapOf<String, Job>()
+    private val retainedTraceOwners = mutableMapOf<Int, String>()
+    private val traceFetchQueue = ArrayDeque<String>()
+    private var activeTraceUid: String? = null
+    private val publicExportJobs = mutableMapOf<String, Job>()
+    private val exportVersions = java.util.concurrent.ConcurrentHashMap<String, Long>()
+    private val exportSequence = java.util.concurrent.atomic.AtomicLong()
+
     init {
         ble.simDistanceM = distanceM
         reloadForMode()
@@ -478,6 +543,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                         }
                     else -> Unit
                 }
+                if (cs == ConnState.DISCONNECTED || cs == ConnState.RECONNECTING) resetTraceTransfers()
                 prev = cs
             }
         }
@@ -506,17 +572,6 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Shots just received and not yet reviewed — drives the results screen
      *  that appears after (re)connecting, before the after-photos prompt. */
-    val newShots = mutableStateListOf<TestResult>()
-    private val pendingTraceUids = mutableMapOf<Int, String>()
-    private val waveformTransferStatus = mutableStateMapOf<String, String>()
-    private val waveformRetryJobs = mutableMapOf<String, Job>()
-    private val seenResultKeys = linkedSetOf<String>().apply {
-        prefs.getString("seenResultKeys", "")
-            .orEmpty()
-            .lineSequence()
-            .filter { it.isNotBlank() }
-            .forEach(::add)
-    }
 
     fun acceptShotResult(uid: String? = newShots.lastOrNull()?.uid) {
         uid ?: return
@@ -528,20 +583,26 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             persistPublicResult(accepted)
         }
         val photoOwnerUid = uid
-        newShots.clear()
+        newShots.removeAll { it.uid == uid }
         showPhotoPrompt("after", photoOwnerUid)
     }
 
     /** Discard only the false reading and restore the prepared, attached rig. */
     fun falseTriggerReset(uid: String? = newShots.lastOrNull()?.uid) {
+        projectRefreshJob?.cancel()
         uid ?: return
         val result = results.firstOrNull { it.uid == uid } ?: return
         waveformRetryJobs.remove(uid)?.cancel()
         pendingTraceUids.entries.removeAll { it.value == uid }
+        traceFetchQueue.remove(uid)
+        retainedTraceOwners.entries.removeAll { it.value == uid }
+        if (activeTraceUid == uid) { activeTraceUid = null; fetchNextWaveform() }
         waveformTransferStatus.remove(uid)
         ble.sendCommand(Proto.CMD_ACK, result.deviceResultId)
         ble.sendCommand(Proto.CMD_DISARM)
-        if (result.shotFolder.isNotBlank()) session.discardShotArtifacts(result.shotFolder)
+        exportVersions.remove(uid)
+        publicExportJobs.remove(uid)?.cancel()
+        if (result.shotFolder.isNotBlank()) synchronized(session) { session.discardShotArtifacts(result.shotFolder) }
         results.removeAll { it.uid == uid }
         newShots.removeAll { it.uid == uid }
         setupResultRecorded = false
@@ -554,17 +615,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun onRawResult(r: RawResult) {
+        if (!r.crcValid) return // Keep the logger's original for a clean retransmission.
         startupHasShotData = true
         routeFirstConnection(ble.status.value)
 
-        val resultKey = if (r.bootId != 0L) {
-            "${r.bootId}:${r.id}"
-        } else {
-            "legacy:${r.id}:${r.splitNs}:${r.epochSec}"
-        }
         // FETCH after a reconnect can re-deliver a result we already stored.
         val existing = results.firstOrNull {
-            it.deviceResultId == r.id && if (r.bootId != 0L && it.bootId != 0L) {
+            it.deviceSerial in ble.deviceIdentityKeys && it.deviceResultId == r.id && if (r.bootId != 0L && it.bootId != 0L) {
                 it.bootId == r.bootId
             } else {
                 it.splitNs == r.splitNs
@@ -574,20 +631,19 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             r.fwMajor >= 3 ||
                 ((ble.hwInfo.value?.capabilities ?: 0) and Proto.CAP_EDGE_TRACE) != 0
         if (existing != null) {
-            rememberResultKey(resultKey)
-            if (traceCapable && !existing.hasWaveform) {
+            retainedTraceOwners[r.id] = existing.uid
+            if (!persist()) return
+            if (traceCapable && existing.traceFormatVersion == 0) {
                 beginWaveformFetch(existing)
             } else {
                 ble.sendCommand(Proto.CMD_ACK, r.id)
             }
             return
         }
-        if (resultKey in seenResultKeys || setupResultRecorded) {
-            // The result was already committed before an activity/process
-            // recreation, or this setup already owns its one allowed result.
-            // Never roll another test folder for a BLE re-delivery/ringing shot.
-            ble.sendCommand(Proto.CMD_ACK, r.id)
-            return
+        // Distinct retained results are real data, even if delivered in one reconnect.
+        if (session.currentTestLogged() || results.any { it.shotFolder == session.activeFolder }) {
+            session.beginNewTest()
+            pendingLabel = session.suggestedLabel()
         }
         val testLabel = preparePendingTestLabel()
         run {
@@ -607,7 +663,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 target = pendingTarget.trim(),
                 targetDistValue = pendingTargetDistVal.replace(',', '.').toDoubleOrNull(),
                 targetDistUnit = pendingTargetDistUnit,
-                deviceSerial = ble.hwInfo.value?.mcuSerial.orEmpty(),
+                deviceSerial = ble.deviceStorageKey,
                 resultFlags = r.flags,
                 rawStartTicks = r.startTicks,
                 rawStopTicks = r.stopTicks,
@@ -621,11 +677,14 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 crcValid = r.crcValid,
                 accepted = false,
             )
-            rec.shotFolder = session.logShot(rec.label, shotJson(rec))
-            rec.thumbnailUri = session.listPhotos(rec.shotFolder).firstOrNull()?.toString() ?: ""
+            rec.shotFolder = session.preparedFolder()
             results.add(0, rec)
-            persist()
-            rememberResultKey(resultKey)
+            if (!persist()) {
+                results.remove(rec)
+                return
+            }
+            session.markCurrentTestLogged()
+            persistPublicResult(rec)
             setupResultRecorded = true
             prefs.edit().putBoolean(setupResultKey(), true).apply()
             prefs.edit()
@@ -638,13 +697,13 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 .putString("pendTdUnit", pendingTargetDistUnit)
                 .apply()
             pendingLabel = session.suggestedLabel()   // Test2, Test3, …
-            newShots.clear()
-            newShots.add(rec)   // exactly one result belongs to this setup
+            newShots.add(rec)
             // A real shot destroys both break-screens: force re-verify (and the
             // sensor-attach flow re-measures the fresh screen's load).
             setSensorReady(1, false)
             setSensorReady(2, false)
             if (traceCapable) {
+                retainedTraceOwners[r.id] = rec.uid
                 beginWaveformFetch(rec)
             } else {
                 ble.sendCommand(Proto.CMD_ACK, r.id)
@@ -652,24 +711,41 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun rememberResultKey(key: String) {
-        seenResultKeys.remove(key)
-        seenResultKeys.add(key)
-        while (seenResultKeys.size > 128) {
-            seenResultKeys.remove(seenResultKeys.first())
-        }
-        prefs.edit().putString("seenResultKeys", seenResultKeys.joinToString("\n")).apply()
-    }
-
     fun requestWaveform(uid: String) {
         val result = results.firstOrNull { it.uid == uid } ?: return
-        if (result.isManual || result.deviceResultId < 0 || result.hasWaveform) return
+        if (result.isManual || result.deviceResultId < 0 || result.traceFormatVersion > 0) return
+        if (retainedTraceOwners[result.deviceResultId] != uid) {
+            waveformTransferStatus[uid] = "Reconnect to the original logger to check for this retained waveform."
+            return
+        }
         beginWaveformFetch(result)
     }
 
     fun waveformStatusFor(uid: String): String? = waveformTransferStatus[uid]
 
+
+    private fun resetTraceTransfers() {
+        waveformRetryJobs.values.forEach { it.cancel() }
+        waveformRetryJobs.clear()
+        pendingTraceUids.clear()
+        retainedTraceOwners.clear()
+        traceFetchQueue.clear()
+        activeTraceUid = null
+    }
+
     private fun beginWaveformFetch(result: TestResult) {
+        if (activeTraceUid == result.uid || result.uid in traceFetchQueue) return
+        traceFetchQueue.addLast(result.uid)
+        waveformTransferStatus[result.uid] = "Waiting to download waveform..."
+        fetchNextWaveform()
+    }
+
+    private fun fetchNextWaveform() {
+        if (activeTraceUid != null) return
+        val nextUid = traceFetchQueue.removeFirstOrNull() ?: return
+        val result = results.firstOrNull { it.uid == nextUid }
+        if (result == null) { fetchNextWaveform(); return }
+        activeTraceUid = nextUid
         val uid = result.uid
         val resultId = result.deviceResultId
         pendingTraceUids[result.deviceResultId] = uid
@@ -681,29 +757,24 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             repeat(2) { retry ->
                 delay(2_500)
                 val current = results.firstOrNull { it.uid == uid }
-                if (current == null || current.hasWaveform) return@launch
+                if (current == null || current.traceFormatVersion > 0) return@launch
                 waveformTransferStatus[uid] = "Retrying waveform ${retry + 1}/2..."
                 pendingTraceUids[resultId] = uid
                 ble.sendCommand(Proto.CMD_FETCH_TRACE, resultId)
             }
             delay(2_500)
-            if (results.firstOrNull { it.uid == uid }?.hasWaveform == false) {
+            if (results.firstOrNull { it.uid == uid }?.traceFormatVersion == 0) {
                 waveformTransferStatus[uid] =
                     "Waveform was not received. Tap Retry waveform."
             }
+            pendingTraceUids.remove(resultId)
+            activeTraceUid = null
+            fetchNextWaveform()
         }
     }
 
     private fun onRawTrace(trace: RawTrace) {
-        val uid = pendingTraceUids.remove(trace.resultId)
-            ?: results.firstOrNull { it.deviceResultId == trace.resultId && !it.hasWaveform }?.uid
-            ?: return
-        if (trace.events.isEmpty()) {
-            waveformRetryJobs.remove(uid)?.cancel()
-            waveformTransferStatus[uid] =
-                "The logger returned no waveform edges. Tap Retry waveform."
-            return
-        }
+        val uid = pendingTraceUids[trace.resultId] ?: return
         val index = results.indexOfFirst { it.uid == uid }
         if (index < 0) return
         val updated = results[index].copy(
@@ -712,14 +783,23 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             traceFlags = trace.flags,
             traceData = WaveformCodec.encode(trace.events),
         )
+        val previous = results[index]
         results[index] = updated
+        if (!persist()) {
+            results[index] = previous
+            return
+        }
+        pendingTraceUids.remove(trace.resultId)
         val newIndex = newShots.indexOfFirst { it.uid == uid }
         if (newIndex >= 0) newShots[newIndex] = updated
         waveformRetryJobs.remove(uid)?.cancel()
-        waveformTransferStatus.remove(uid)
-        persist()
+        if (trace.events.isEmpty()) waveformTransferStatus[uid] = "Saved. The logger captured no waveform edges."
+        else waveformTransferStatus.remove(uid)
         persistPublicResult(updated)
         ble.sendCommand(Proto.CMD_ACK, trace.resultId)
+        retainedTraceOwners.remove(trace.resultId)
+        activeTraceUid = null
+        fetchNextWaveform()
     }
 
     fun applyReviewedTiming(uid: String, startOffsetTicks: Long, stopOffsetTicks: Long) {
@@ -840,11 +920,14 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             outcome = specialNotes.trim(),
             manualVelocityMps = mps,
         )
-        rec.shotFolder = session.logShot(rec.label, shotJson(rec))
+        rec.shotFolder = session.preparedFolder()
+        results.add(0, rec)
+        if (!persist()) { results.remove(rec); return }
+        session.markCurrentTestLogged()
         for (uri in photos) session.importPhoto(rec.shotFolder, uri)
         rec.thumbnailUri = session.listPhotos(rec.shotFolder).firstOrNull()?.toString() ?: ""
-        results.add(0, rec)
         persist()
+        persistPublicResult(rec)
         pendingLabel = session.suggestedLabel()
         showPhotoPrompt("after", rec.uid)
     }
@@ -854,7 +937,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (idx < 0) return
         results[idx] = results[idx].copy(thumbnailUri = uri)
         persist()
-        session.updateShot(results[idx].shotFolder, shotJson(results[idx]))
+        persistPublicResult(results[idx])
     }
 
     /** Copy user-picked images into a result's shot folder (edit dialog). */
@@ -866,7 +949,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         if (r.shotFolder.isBlank()) {
             results[idx] = r.copy(shotFolder = rel)
             persist()
-            session.updateShot(rel, shotJson(results[idx]))
+            persistPublicResult(results[idx])
         }
         for (uri in uris) session.importPhoto(rel, uri)
         autoThumbnailForFirstResultPhoto(uid)
@@ -880,7 +963,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         val uri = preferred ?: session.listPhotos(results[idx].shotFolder).firstOrNull() ?: return
         results[idx] = results[idx].copy(thumbnailUri = uri.toString())
         persist()
-        session.updateShot(results[idx].shotFolder, shotJson(results[idx]))
+        persistPublicResult(results[idx])
     }
 
     fun deleteResultPhoto(uid: String, uri: Uri) {
@@ -890,7 +973,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 results[idx] = results[idx].copy(thumbnailUri = "")
                 persist()
                 autoThumbnailForFirstResultPhoto(uid)
-                session.updateShot(results[idx].shotFolder, shotJson(results[idx]))
+                persistPublicResult(results[idx])
             }
             photoRevision++
         }
@@ -1000,23 +1083,48 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun persistPublicResult(r: TestResult) {
         if (r.shotFolder.isBlank()) return
-        session.updateShot(r.shotFolder, shotJson(r))
-        if (r.hasWaveform) {
-            session.updateWaveform(r.shotFolder, waveformJson(r))
-            val image = WaveformImageRenderer.renderPng(r, accuracyEnvelopePercentFor(r))
-            if (image.isNotEmpty()) session.updateWaveformImage(r.shotFolder, image)
+        val targetSession = session
+        val snapshot = r.copy()
+        val gae = accuracyEnvelopePercentFor(r)
+        val recordJson = shotJson(snapshot)
+        val traceJson = if (snapshot.hasWaveform) waveformJson(snapshot) else null
+        // Serialize exports and keep PNG rendering and provider writes off the UI thread.
+        val version = exportSequence.incrementAndGet()
+        exportVersions[r.uid] = version
+        publicExportJobs[r.uid]?.cancel()
+        publicExportJobs[r.uid] = viewModelScope.launch {
+            val success = withContext(Dispatchers.IO) {
+                runCatching { synchronized(targetSession) {
+                    if (exportVersions[r.uid] != version) return@synchronized true
+                    var ok = targetSession.updateShot(snapshot.shotFolder, recordJson)
+                    if (snapshot.hasWaveform) {
+                        ok = targetSession.updateWaveform(snapshot.shotFolder, traceJson!!) && ok
+                        val image = WaveformImageRenderer.renderPng(snapshot, gae)
+                        ok = image.isNotEmpty() && targetSession.updateWaveformImage(snapshot.shotFolder, image) && ok
+                    }
+                    ok
+                } }.getOrDefault(false)
+            }
+            if (!success) storageMessage = "Saved on this phone. The public file copy failed. Free storage space, then tap Retry."
         }
     }
 
+
     fun deleteResult(uid: String) {
+        projectRefreshJob?.cancel()
         val result = results.firstOrNull { it.uid == uid } ?: return
-        if (result.shotFolder.isBlank() || session.deleteTestFolder(result.shotFolder)) {
+        exportVersions.remove(uid)
+        publicExportJobs.remove(uid)?.cancel()
+        if (result.shotFolder.isBlank() || synchronized(session) { session.deleteTestFolder(result.shotFolder) }) {
             results.removeAll { it.uid == uid }
             persist()
         }
     }
 
-    private fun persist() = store.save(results.toList())
+    private fun persist(): Boolean = store.save(results.toList()).also { saved ->
+        if (!saved) storageMessage =
+            "Could not save the local library. Keep the logger powered on; new readings have not been acknowledged. Free storage space and tap Retry."
+    }
 
     /** Per-mode namespacing so simulated calibration never touches real cal data. */
     private fun calKey(key: String) = "cal_${ble.deviceStorageKey}_$key"
@@ -1068,7 +1176,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         val loadedResults = mergeLoadedResults(publicResults, cachedResults)
         results.clear()
         results.addAll(loadedResults)
-        store.save(loadedResults)
+        persist()
         calData.clear()
         for (key in listOf("b1", "b2", "l1", "l2")) {
             prefs.getString(calKey(key), null)?.split(",")?.let { p ->
@@ -1081,35 +1189,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         projectPrompt = session.needsProjectPrompt()
     }
 
-    /**
-     * Public folders are authoritative, but a MediaStore scan must never
-     * downgrade a just-received trace to an older shot.json copy. The private
-     * cache is also a fallback when an app reinstall lost the active-project
-     * preference before public folder discovery completed.
-     */
+    /** Import unknown public records without overwriting the durable library. */
     private fun mergeLoadedResults(
         publicResults: List<TestResult>,
         fallbackResults: List<TestResult>,
-    ): List<TestResult> {
-        if (publicResults.isEmpty()) return fallbackResults
-        return publicResults.map { public ->
-            val fallback = fallbackResults.firstOrNull {
-                it.uid == public.uid ||
-                    (it.shotFolder.isNotBlank() && it.shotFolder == public.shotFolder)
-            } ?: return@map public
-            if (public.hasWaveform || !fallback.hasWaveform) return@map public
-            public.copy(
-                traceFormatVersion = fallback.traceFormatVersion,
-                traceBaseTicks = fallback.traceBaseTicks,
-                traceFlags = fallback.traceFlags,
-                traceData = fallback.traceData,
-                reviewedSplitNs = fallback.reviewedSplitNs,
-                reviewedStartOffsetTicks = fallback.reviewedStartOffsetTicks,
-                reviewedStopOffsetTicks = fallback.reviewedStopOffsetTicks,
-                reviewedAtMillis = fallback.reviewedAtMillis,
-            )
-        }
-    }
+    ): List<TestResult> = recoverResults(publicResults, fallbackResults)
 
     /** Re-read public shot folders after Files, USB, or another app changes them. */
     fun refreshProjectData() {
@@ -1121,17 +1205,14 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         projectRefreshJob = viewModelScope.launch {
             if (delayMs > 0) delay(delayMs)
             val activeSession = session
-            val activeStore = store
-            val inMemoryResults = (results.toList() + newShots.toList())
-                .distinctBy { it.uid }
             val publicResults = withContext(Dispatchers.IO) {
                 activeSession.loadProjectResults()
             }
             if (session !== activeSession) return@launch
-            val loadedResults = mergeLoadedResults(publicResults, inMemoryResults)
+            val loadedResults = mergeLoadedResults(publicResults, results.toList())
             results.clear()
             results.addAll(loadedResults)
-            withContext(Dispatchers.IO) { activeStore.save(loadedResults) }
+            persist()
             val generatedLabel = Regex("^Test[0-9]+$", RegexOption.IGNORE_CASE)
                 .matches(pendingLabel.trim())
             if (pendingLabel.isBlank() || generatedLabel) {
@@ -1438,8 +1519,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         ble.sendCommand(Proto.CMD_CANCEL)
     }
 
-    fun arm() = ble.sendCommand(Proto.CMD_ARM)
-    fun armWithOverride() = ble.sendCommand(Proto.CMD_ARM_OVERRIDE)
+    private fun canRequestArm(): Boolean = ble.connState.value == ConnState.CONNECTED &&
+        (ble.status.value?.pendingCount ?: 16) < 16
+
+    fun arm() { if (canRequestArm()) ble.sendCommand(Proto.CMD_ARM) }
+    fun armWithOverride() { if (canRequestArm()) ble.sendCommand(Proto.CMD_ARM_OVERRIDE) }
     fun disarm() = ble.sendCommand(Proto.CMD_DISARM)
     fun syncTime() = ble.syncTime()
     fun checkPorts() {
@@ -1466,16 +1550,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         browsingRealLogs = true
         setUiMode("saved_logs")
         results.clear()
-        results.addAll(realSession.loadProjectResults())
-        realStore.save(results.toList())
-        val waveformImages = results.filter { it.hasWaveform && it.shotFolder.isNotBlank() }
-            .map { it to accuracyEnvelopePercentFor(it) }
-        viewModelScope.launch(Dispatchers.IO) {
-            waveformImages.forEach { (result, gae) ->
-                val image = WaveformImageRenderer.renderPng(result, gae)
-                if (image.isNotEmpty()) realSession.updateWaveformImage(result.shotFolder, image)
-            }
-        }
+        results.addAll(recoverResults(realSession.loadProjectResults(), realStore.load()))
+        persist()
         newShots.clear()
         screen = Screen.SAVED_LOGS
     }
