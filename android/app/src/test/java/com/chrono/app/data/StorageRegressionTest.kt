@@ -128,4 +128,13 @@ class StorageRegressionTest {
         assertEquals("real", real.load().single().uid)
         assertEquals("sim", sim.load().single().uid)
     }
+
+    @Test fun simulationPhotoUrisWorkOnOlderAndroid() {
+        val session = SessionManager(app, simulation = true)
+        session.startProject("demo")
+        val first = session.newPhotoUri("setup", "Test1")
+        val second = session.newPhotoUri("setup", "Test1")
+        assertNotNull(first)
+        assertNotEquals(first, second)
+    }
 }

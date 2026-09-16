@@ -34,7 +34,13 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn nicenano:nrf52:nicenanov2pf \
+            --output-dir build/firmware-nice-nano \
             firmware/ChronographNiceNano
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-nice-nano
+          path: build/firmware-nice-nano/
 
   xiao:
     runs-on: ubuntu-latest
@@ -59,4 +65,10 @@ jobs:
         run: |
           arduino-cli compile \
             --fqbn Seeeduino:nrf52:xiaonRF52840 \
+            --output-dir build/firmware-xiao \
             firmware/ChronographXiao
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-xiao
+          path: build/firmware-xiao/

@@ -242,9 +242,10 @@ To share the app without a cable: *Build → Build App Bundle(s) / APK(s) → Bu
 then copy `android/app/build/outputs/apk/debug/app-debug.apk` to any phone and open
 it (allow "install from unknown sources" when asked).
 
-> Command-line note: the project ships without the Gradle wrapper JAR. Android
-> Studio doesn't need it, but if you want `gradlew` on the command line, run
-> `gradle wrapper` once in `android/` (requires a local Gradle install).
+> The repository includes the Gradle 8.9 wrapper and its distribution checksum.
+> With Java 17 and the Android SDK installed, run `android/gradlew.bat -p android
+> testDebugUnitTest lintDebug assembleDebug` on Windows (use `sh android/gradlew`
+> on Linux/macOS). Use `scripts/build-signed.ps1` for persistent local signing.
 
 ---
 

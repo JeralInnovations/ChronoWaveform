@@ -24,8 +24,18 @@ jobs:
         with:
           gradle-version: "8.9"
 
-      - name: Test, lint and build debug APK
+      - name: Test, lint and build APKs
         run: gradle -p android testDebugUnitTest lintDebug assembleDebug assembleRelease
+
+      - name: Upload validation reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-validation-reports
+          path: |
+            android/app/build/test-results/testDebugUnitTest/
+            android/app/build/reports/tests/testDebugUnitTest/
+            android/app/build/reports/lint-results-debug.*
 
       - uses: actions/upload-artifact@v4
         with:

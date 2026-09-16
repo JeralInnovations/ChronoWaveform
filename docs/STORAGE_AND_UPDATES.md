@@ -89,6 +89,15 @@ For a local signed build, set `CHRONO_KEYSTORE_FILE` to the absolute keystore pa
 set the matching password/alias environment variables, and run
 `gradle -p android assembleRelease`. Unsigned builds are not installable updates.
 
+On Windows with Java and Android SDK configured, `scripts/build-signed.ps1
+-CreateKey` creates a new signing identity once if none exists, then builds the
+release. Later runs omit `-CreateKey` and reuse the saved identity. The key and
+credentials are kept outside the repository in `%USERPROFILE%/.chrono-waveform/signing`;
+back up that private directory. For an existing key, supply its directory and a
+`credentials.json` containing its `alias` and `password` (same store/key password).
+The script also accepts a CI unsigned APK with `-UnsignedApk` and an SDK
+`-ApkSignerCommand` path, then verifies the signed output.
+
 Android references: [app signing](https://developer.android.com/studio/publish/app-signing),
 [document access through the file picker](https://developer.android.com/training/data-storage/shared/documents-files),
 [AtomicFile](https://developer.android.com/reference/android/util/AtomicFile).
