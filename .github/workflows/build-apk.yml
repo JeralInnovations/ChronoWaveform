@@ -25,12 +25,17 @@ jobs:
           gradle-version: "8.9"
 
       - name: Test, lint and build debug APK
-        run: gradle -p android testDebugUnitTest lintDebug assembleDebug
+        run: gradle -p android testDebugUnitTest lintDebug assembleDebug assembleRelease
 
       - uses: actions/upload-artifact@v4
         with:
           name: chrono-debug-apk
           path: android/app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chrono-release-unsigned-apk
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
 
       # Release APKs must use the SAME protected key on every build. Fresh CI
       # debug keys force uninstall/reinstall and destroy the private library.

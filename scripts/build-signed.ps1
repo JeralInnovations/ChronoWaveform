@@ -1,6 +1,8 @@
 param(
     [string]$SigningDirectory = (Join-Path $env:USERPROFILE '.chrono-waveform/signing'),
     [string]$GradleCommand,
+    [string]$UnsignedApk,
+    [string]$ApkSignerCommand,
     [switch]$CreateKey
 )
 
@@ -41,8 +43,22 @@ $env:CHRONO_KEYSTORE_PASSWORD = $credentials.password
 $env:CHRONO_KEY_PASSWORD = $credentials.password
 $env:CHRONO_KEY_ALIAS = $credentials.alias
 try {
-    & $GradleCommand -p (Join-Path $projectRoot 'android') assembleRelease
-    if ($LASTEXITCODE -ne 0) { throw 'Signed APK build failed.' }
+    if ($UnsignedApk) {
+        if (!$ApkSignerCommand) { throw 'Supply -ApkSignerCommand with the Android SDK apksigner path.' }
+        $artifactDirectory = Join-Path $projectRoot 'artifacts'
+        New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
+        $outputApk = Join-Path $artifactDirectory 'ChronoWaveform-2.2.0.apk'
+        & $ApkSignerCommand sign --ks $keyPath --ks-key-alias $credentials.alias `
+            --ks-pass env:CHRONO_KEYSTORE_PASSWORD --key-pass env:CHRONO_KEY_PASSWORD `
+            --out $outputApk $UnsignedApk
+        if ($LASTEXITCODE -ne 0) { throw 'APK signing failed.' }
+        & $ApkSignerCommand verify $outputApk
+        if ($LASTEXITCODE -ne 0) { throw 'APK signature verification failed.' }
+        Write-Host "Signed APK: $outputApk"
+    } else {
+        & $GradleCommand -p (Join-Path $projectRoot 'android') assembleRelease
+        if ($LASTEXITCODE -ne 0) { throw 'Signed APK build failed.' }
+    }
 } finally {
     Remove-Item Env:CHRONO_KEYSTORE_PASSWORD, Env:CHRONO_KEY_PASSWORD -ErrorAction SilentlyContinue
 }
