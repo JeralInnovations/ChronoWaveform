@@ -1955,6 +1955,10 @@ private fun ResultCard(
                         Text("Fetch waveform")
                     }
                 }
+                if (r.resultFlags and Proto.RESULT_ARM_OVERRIDE != 0) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("Armed with verification override", style = MaterialTheme.typography.bodyMedium, color = Amber)
+                }
                 r.timingFaultText()?.let { fault ->
                     Spacer(Modifier.height(6.dp))
                     Text(fault, style = MaterialTheme.typography.bodyMedium, color = Bad)
