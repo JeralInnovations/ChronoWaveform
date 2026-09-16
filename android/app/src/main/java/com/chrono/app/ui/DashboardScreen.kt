@@ -146,6 +146,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     var editing by remember { mutableStateOf<TestResult?>(null) }
     var waveformReviewResult by remember { mutableStateOf<TestResult?>(null) }
     var manualEntry by remember { mutableStateOf(false) }
+    var confirmArmOverride by remember { mutableStateOf(false) }
     // (photo uri, owning result uid) so the viewer can offer "set as cover"
     var fullscreenPhoto by remember { mutableStateOf<Pair<android.net.Uri, String>?>(null) }
     var promptPhotoPreview by remember { mutableStateOf<android.net.Uri?>(null) }
@@ -267,7 +268,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     enabled = connState == ConnState.CONNECTED && !armed && !running,
                     onCheck = { vm.checkPorts() },
                     onIdentify = { vm.identifyLogger() },
-                    onOverride = { vm.armWithOverride() },
+                    onOverride = { confirmArmOverride = true },
                 )
             }
 
@@ -283,6 +284,28 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     onArm = { vm.arm() },
                     onDisarm = { vm.disarm() },
                 )
+            }
+
+            if (!armed && !running && (!vm.sensor1Ready || !vm.sensor2Ready)) {
+                item {
+                    OutlinedButton(
+                        onClick = { confirmArmOverride = true },
+                        enabled = vm.canRequestArm(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Arm without tap tests", color = Amber) }
+                }
+            }
+
+            item {
+                Text(
+                    "Logger: ${deviceStatus?.pendingCount ?: "?"} pending readings. " +
+                        "Saved readings are removed from the logger; unsaved readings are lost if it restarts.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextDim,
+                )
+                TextButton(onClick = { vm.reloadPendingShots() }, enabled = vm.canReloadPendingShots()) {
+                    Text("Reload pending shots")
+                }
             }
 
             if (vm.canAddSetupPhotos && setupPhotos.isNotEmpty()) {
@@ -358,6 +381,23 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 )
             }
         }
+    }
+
+    if (confirmArmOverride) {
+        AlertDialog(
+            onDismissRequest = { confirmArmOverride = false },
+            title = { Text("Arm without verification?") },
+            text = { Text("Tap tests may be incomplete and port-health warnings will be overridden. " +
+                "The logger may miss the shot or return an invalid reading. Sensors remain unverified; " +
+                "the result will be marked as an override. This arms measurement only.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmArmOverride = false; vm.armWithOverride() },
+                    enabled = vm.canRequestArm(),
+                ) { Text("I understand — arm") }
+            },
+            dismissButton = { TextButton(onClick = { confirmArmOverride = false }) { Text("Cancel") } },
+        )
     }
 
     // Sensor-attach flow: fit wire -> RC signature check -> tap test.

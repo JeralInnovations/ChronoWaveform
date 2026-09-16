@@ -1519,11 +1519,24 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         ble.sendCommand(Proto.CMD_CANCEL)
     }
 
-    private fun canRequestArm(): Boolean = ble.connState.value == ConnState.CONNECTED &&
-        (ble.status.value?.pendingCount ?: 16) < 16
+    fun canReloadPendingShots(): Boolean = ble.connState.value == ConnState.CONNECTED &&
+        !calRunning &&
+        ble.status.value?.state in setOf(Proto.ST_IDLE, Proto.ST_FAULT, Proto.ST_VERIFY1_OK, Proto.ST_VERIFY2_OK)
 
-    fun arm() { if (canRequestArm()) ble.sendCommand(Proto.CMD_ARM) }
+    fun canRequestArm(): Boolean = canReloadPendingShots() && (ble.status.value?.pendingCount ?: 16) < 16
+
+    fun arm() { if (canRequestArm() && sensor1Ready && sensor2Ready) ble.sendCommand(Proto.CMD_ARM) }
     fun armWithOverride() { if (canRequestArm()) ble.sendCommand(Proto.CMD_ARM_OVERRIDE) }
+    /** Skipping setup never marks a sensor as verified or arms the logger. */
+    fun skipRemainingTapTests() {
+        if (ble.connState.value != ConnState.CONNECTED || calRunning) return
+        cancelCalibrationToDashboard()
+        continueToDistance()
+    }
+
+    fun reloadPendingShots() {
+        if (canReloadPendingShots()) ble.sendCommand(Proto.CMD_FETCH)
+    }
     fun disarm() = ble.sendCommand(Proto.CMD_DISARM)
     fun syncTime() = ble.syncTime()
     fun checkPorts() {

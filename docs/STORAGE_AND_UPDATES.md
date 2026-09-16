@@ -102,7 +102,24 @@ Android references: [app signing](https://developer.android.com/studio/publish/a
 [document access through the file picker](https://developer.android.com/training/data-storage/shared/documents-files),
 [AtomicFile](https://developer.android.com/reference/android/util/AtomicFile).
 
-## Firmware 3.3
+## Tap-test override and device recovery (app 2.2.1)
+
+Sensor setup offers **Skip remaining tap tests** with acknowledgement, then opens
+the distance review. It does not mark sensors as verified or arm the logger.
+On the dashboard, **Arm without tap tests** requires a separate acknowledgement
+that missing or invalid readings are possible. It uses the existing logged
+firmware override, including overriding port-health refusals; the saved result
+carries the override flag. Connection, idle-state and available-buffer checks
+still apply. Each subsequent unverified arm requires acknowledgement again.
+
+**Reload pending shots** requests the logger's unacknowledged RAM readings.
+Reconnect already requests these automatically. ACK removes the device's copy
+after the app saves the reading and waveform. Therefore this is transfer
+recovery, not an archive of all past shots: acknowledged readings cannot be
+re-downloaded, and restarting/powering off the logger clears its RAM buffer.
+The app does not need tap verification to receive retained readings.
+
+## Firmware 3.3 behavior
 
 All three sketch variants refuse another ARM when all 16 pending slots are in use;
 they no longer evict the oldest unacknowledged reading. The ACK ring has capacity
