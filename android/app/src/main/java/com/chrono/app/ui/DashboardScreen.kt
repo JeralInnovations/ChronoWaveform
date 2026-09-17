@@ -147,6 +147,8 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     var waveformReviewResult by remember { mutableStateOf<TestResult?>(null) }
     var manualEntry by remember { mutableStateOf(false) }
     var confirmArmOverride by remember { mutableStateOf(false) }
+    var recoveryUid by remember { mutableStateOf<String?>(null) }
+    val recoveryMessage by vm.ble.recoveryMessage.collectAsState()
     // (photo uri, owning result uid) so the viewer can offer "set as cover"
     var fullscreenPhoto by remember { mutableStateOf<Pair<android.net.Uri, String>?>(null) }
     var promptPhotoPreview by remember { mutableStateOf<android.net.Uri?>(null) }
@@ -178,6 +180,29 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         item { TopBar(vm, connState, deviceStatus) }
+
+        item {
+            Card {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Shot recovery", style = MaterialTheme.typography.titleMedium)
+                    Text(recoveryMessage, color = TextDim)
+                    if (deviceStatus?.recoveryStorageFailed == true) {
+                        Text("Logger flash backup failed. Keep it powered on until the reading is saved on the phone.", color = Bad)
+                    }
+                    val drafts = vm.availableShotDrafts()
+                    if (drafts.isNotEmpty()) Text("${drafts.size} saved test setups waiting for a reading.", color = TextDim)
+                    vm.results.filter { it.needsShotInfo }.forEach { reading ->
+                        OutlinedButton(onClick = { recoveryUid = reading.uid }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Link shot info: ${reading.splitTimeText()} • ${reading.formattedDate() ?: "time unknown"}")
+                        }
+                    }
+                    TextButton(onClick = { vm.reloadPendingShots() }, enabled = vm.canReloadPendingShots()) {
+                        Text("Check logger again")
+                    }
+                    Text("Unlinked readings stay saved on this phone for later.", style = MaterialTheme.typography.bodySmall, color = TextDim)
+                }
+            }
+        }
 
         if (connState == ConnState.RECONNECTING) {
             item { ReconnectingBanner() }
@@ -299,7 +324,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
             item {
                 Text(
                     "Logger: ${deviceStatus?.pendingCount ?: "?"} pending readings. " +
-                        "Saved readings are removed from the logger; unsaved readings are lost if it restarts.",
+                        "Firmware 3.4 keeps the latest completed capture across restarts; older pending shots remain RAM-only.",
                     style = MaterialTheme.typography.bodySmall,
                     color = TextDim,
                 )
@@ -397,6 +422,34 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 ) { Text("I understand — arm") }
             },
             dismissButton = { TextButton(onClick = { confirmArmOverride = false }) { Text("Cancel") } },
+        )
+    }
+
+    recoveryUid?.let { uid ->
+        val reading = vm.results.firstOrNull { it.uid == uid && it.needsShotInfo }
+        if (reading != null) AlertDialog(
+            onDismissRequest = { recoveryUid = null },
+            title = { Text("Attach reading to shot info") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${reading.splitTimeText()} • ${reading.formattedDate() ?: "time unknown"}")
+                    Text("Choose the matching saved setup. The measurement stays unchanged; its speed uses that setup's gate distance.")
+                    vm.availableShotDrafts().filter { it.deviceSerial == reading.deviceSerial }.forEach { draft ->
+                        OutlinedButton(onClick = {
+                            if (vm.linkRecoveredReading(uid, draft.uid)) recoveryUid = null
+                        }, modifier = Modifier.fillMaxWidth()) {
+                            Text("${draft.label} • ${draft.formattedDate() ?: "time unknown"}")
+                        }
+                    }
+                    Text("Or review the Next test details and gate distance, then use them for this reading.", color = TextDim)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { if (vm.linkRecoveredToCurrentInfo(uid)) recoveryUid = null }) {
+                    Text("Use current details: ${vm.pendingLabel}")
+                }
+            },
+            dismissButton = { TextButton(onClick = { recoveryUid = null }) { Text("Keep for later") } },
         )
     }
 

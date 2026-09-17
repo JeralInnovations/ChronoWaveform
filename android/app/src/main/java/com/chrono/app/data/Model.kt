@@ -66,6 +66,9 @@ data class TestResult(
     var thumbnailUri: String = "",
     /** New device readings remain provisional until the operator accepts them. */
     var accepted: Boolean = true,
+    /** A recovered measurement with no proven association to shot setup. */
+    var needsShotInfo: Boolean = false,
+    var linkedDraftUid: String = "",
 ) {
     val isManual: Boolean get() = deviceResultId < 0
     val isReversed: Boolean get() = resultFlags and 0x04 != 0 && splitNs > 0
@@ -217,14 +220,16 @@ internal fun testResultFromJson(
         shotFolder = folder.ifBlank { o.optString("shotFolder", "") },
         thumbnailUri = o.optString("thumbnailUri", ""),
         accepted = o.optBoolean("accepted", true),
+        needsShotInfo = o.optBoolean("needsShotInfo", false),
+        linkedDraftUid = o.optString("linkedDraftUid", ""),
     )
 }
 
 /** Durable local library. Public project files are portable copies, not the database. */
-class ResultStore(context: Context, simulation: Boolean = false) {
+class ResultStore(context: Context, simulation: Boolean = false, fileName: String? = null) {
     // Simulated runs persist to their own file so demo data never mixes with
     // real results.
-    private val file = File(context.filesDir, if (simulation) "results_sim.json" else "results.json")
+    private val file = File(context.filesDir, fileName ?: if (simulation) "results_sim.json" else "results.json")
 
     private val atomic = AtomicFile(file)
     private var unreadable = false
@@ -263,6 +268,8 @@ class ResultStore(context: Context, simulation: Boolean = false) {
 internal fun testResultToJson(r: TestResult): JSONObject =
     JSONObject()
         .put("uid", r.uid)
+        .put("needsShotInfo", r.needsShotInfo)
+        .put("linkedDraftUid", r.linkedDraftUid)
         .put("deviceResultId", r.deviceResultId)
         .put("splitNs", r.splitNs)
         .put("distanceM", r.distanceM)

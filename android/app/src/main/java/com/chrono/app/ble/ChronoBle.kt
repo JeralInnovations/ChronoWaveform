@@ -40,6 +40,7 @@ object Proto {
     val INFO: UUID = UUID.fromString("a5c40007-9d95-4e4c-8c5a-c1d6f2a80de1")
     val HEALTH: UUID = UUID.fromString("a5c40008-9d95-4e4c-8c5a-c1d6f2a80de1")
     val TRACE: UUID = UUID.fromString("a5c40009-9d95-4e4c-8c5a-c1d6f2a80de1")
+    val RECOVERY: UUID = UUID.fromString("a5c4000a-9d95-4e4c-8c5a-c1d6f2a80de1")
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     const val CMD_VERIFY1: Byte = 1
@@ -90,6 +91,9 @@ data class DeviceStatus(
     val timeValid: Boolean,
     val batteryPercent: Int? = null,
     val batteryMv: Int? = null,
+    val bootId: Long? = null,
+    val nextResultId: Int? = null,
+    val recoveryStorageFailed: Boolean = false,
 ) {
     val lowBattery: Boolean
         get() = (batteryPercent != null && batteryPercent <= 15) ||
@@ -213,6 +217,8 @@ class ChronoBle(private val context: Context) {
 
     val connState = MutableStateFlow(ConnState.DISCONNECTED)
     val status = MutableStateFlow<DeviceStatus?>(null)
+    val recoveryChecked = MutableStateFlow(false)
+    val recoveryMessage = MutableStateFlow("Latest logger reading has not been checked.")
     val results = MutableSharedFlow<RawResult>(extraBufferCapacity = 32)
     val traces = MutableSharedFlow<RawTrace>(extraBufferCapacity = 16)
     val cal = MutableSharedFlow<CalReading>(extraBufferCapacity = 8)
@@ -235,6 +241,7 @@ class ChronoBle(private val context: Context) {
     private var chInfo: BluetoothGattCharacteristic? = null
     private var chHealth: BluetoothGattCharacteristic? = null
     private var chTrace: BluetoothGattCharacteristic? = null
+    private var chRecovery: BluetoothGattCharacteristic? = null
     private var smoothedBatteryMv: Int? = null
     private var smoothedBatteryPercent: Int? = null
 
@@ -369,6 +376,8 @@ class ChronoBle(private val context: Context) {
         private set
     private val simBufferedResults = mutableListOf<RawResult>()
     private val simTraces = mutableMapOf<Int, RawTrace>()
+    private var simLatest: RawResult? = null
+    private var simLatestTrace: RawTrace? = null
 
     fun connectSimulated() {
         stopScan()
@@ -385,6 +394,9 @@ class ChronoBle(private val context: Context) {
         simBarePhase = true
         simBufferedResults.clear()
         simTraces.clear()
+        simLatest = null
+        simLatestTrace = null
+        recoveryChecked.value = true
         hwInfo.value = HwInfo(2, 3, 0, 62_500, 30, 300, "SIM-0001", 2, 1, 0x000F)
         setSimFault(SimFault.NONE)
         pushSimStatus()
@@ -419,7 +431,8 @@ class ChronoBle(private val context: Context) {
     }
 
     private fun pushSimStatus() {
-        status.value = DeviceStatus(simState, simPending, simTimeValid, batteryPercent = 82, batteryMv = 3990)
+        status.value = DeviceStatus(simState, simPending, simTimeValid, batteryPercent = 82, batteryMv = 3990,
+            bootId = 0x53494D31, nextResultId = simNextId)
     }
 
     fun setSimFault(fault: SimFault) {
@@ -462,7 +475,7 @@ class ChronoBle(private val context: Context) {
                 pushSimStatus()
             }
             Proto.CMD_FETCH -> flushSimBufferedResults()
-            Proto.CMD_FETCH_TRACE -> simTraces[arg]?.let { traces.tryEmit(it) }
+            Proto.CMD_FETCH_TRACE -> (simTraces[arg] ?: simLatestTrace?.takeIf { it.resultId == arg })?.let { traces.tryEmit(it) }
             Proto.CMD_CALIBRATE -> simCalibrate(arg)
             Proto.CMD_HEALTH -> { setSimFault(simFault); pushSimStatus() }
             Proto.CMD_IDENTIFY -> Unit
@@ -551,6 +564,8 @@ class ChronoBle(private val context: Context) {
                 startTicks = 1000, stopTicks = 1000 + split / 62, batteryMv = 3990,
                 bootId = 0x53494D31, hwRev = 2, fwMajor = 3, formatVersion = 2)
             simTraces[result.id] = simulatedTrace(result.id, split)
+            simLatest = result
+            simLatestTrace = simTraces[result.id]
             simBufferedResults.add(result)
             if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
             simState = Proto.ST_IDLE
@@ -723,6 +738,23 @@ class ChronoBle(private val context: Context) {
         }
     }
 
+    /** Read the persistent latest capture, or the legacy last-value cache. No ACK here. */
+    fun checkLatestReading() {
+        recoveryChecked.value = false
+        recoveryMessage.value = "Checking the logger's latest reading..."
+        if (isSimulation) {
+            simLatest?.let { results.tryEmit(it) }
+            recoveryChecked.value = true
+            recoveryMessage.value = "Latest logger reading checked."
+            return
+        }
+        enqueue {
+            val g = gatt ?: return@enqueue false
+            val characteristic = chRecovery ?: chResult ?: return@enqueue false
+            g.readCharacteristic(characteristic)
+        }
+    }
+
     private fun readInfo() {
         enqueue {
             val g = gatt ?: return@enqueue false
@@ -794,6 +826,8 @@ class ChronoBle(private val context: Context) {
             chInfo = svc.getCharacteristic(Proto.INFO)  // optional (newer firmware)
             chHealth = svc.getCharacteristic(Proto.HEALTH) // optional (protocol v2)
             chTrace = svc.getCharacteristic(Proto.TRACE)   // optional waveform stream
+            chRecovery = svc.getCharacteristic(Proto.RECOVERY)
+            recoveryChecked.value = false
             if (chStatus == null || chControl == null || chResult == null || chTime == null) {
                 g.disconnect()
                 return
@@ -806,8 +840,6 @@ class ChronoBle(private val context: Context) {
             readInfo()
             readStatus()
             readHealth()
-            syncTime()                        // sync clock on every (re)connect
-            sendCommand(Proto.CMD_FETCH)      // collect results recorded while disconnected
             enqueue {
                 prefs.edit()
                     .putString("lastSuccessfulAddress", g.device.address)
@@ -817,6 +849,9 @@ class ChronoBle(private val context: Context) {
                 connState.value = ConnState.CONNECTED
                 false // action-only op: report "didn't start a GATT call" so the queue moves on
             }
+            syncTime()
+            sendCommand(Proto.CMD_FETCH)
+            checkLatestReading()
         }
 
         override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
@@ -833,6 +868,12 @@ class ChronoBle(private val context: Context) {
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
             if (g !== gatt) return
             if (status == BluetoothGatt.GATT_SUCCESS) c.value?.let { handleValue(c.uuid, it) }
+            if (c.uuid == Proto.RECOVERY || c.uuid == Proto.RESULT) {
+                recoveryChecked.value = true
+                recoveryMessage.value = if (status != BluetoothGatt.GATT_SUCCESS) "Latest reading check failed. Tap Check logger again."
+                    else if (chRecovery == null) "Latest reading checked. This older firmware only keeps a RAM copy."
+                    else "Latest reading checked. Firmware retains its latest capture across restarts."
+            }
             opDone()
         }
 
@@ -873,9 +914,12 @@ class ChronoBle(private val context: Context) {
                     timeValid = v[2].toInt() != 0,
                     batteryPercent = batteryPercent,
                     batteryMv = batteryMv,
+                    bootId = if (v.size >= 13) ByteBuffer.wrap(v, 7, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xffffffffL else null,
+                    nextResultId = if (v.size >= 13) ByteBuffer.wrap(v, 11, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xffff else null,
+                    recoveryStorageFailed = v.size >= 14 && v[13].toInt() and 1 != 0,
                 )
             }
-            Proto.RESULT -> ResultPacket.decode(v)?.let { results.tryEmit(it) }
+            Proto.RESULT, Proto.RECOVERY -> ResultPacket.decode(v)?.takeIf { it.id > 0 }?.let { results.tryEmit(it) }
             Proto.TRACE -> if (v.size >= 18) {
                 val payloadLength = v.size - 2
                 val packetCrc = (v[payloadLength].toInt() and 0xFF) or

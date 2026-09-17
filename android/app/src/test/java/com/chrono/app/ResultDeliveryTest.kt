@@ -85,4 +85,19 @@ class ResultDeliveryTest {
         vm.ble.connState.value = ConnState.RECONNECTING
         assertFalse(vm.canRequestArm())
     }
+
+    @Test fun latestCheckAfterAcknowledgementDoesNotDuplicateAndKeepsAssociation() {
+        val vm = viewModel()
+        vm.pendingLabel = "Test4"
+        vm.armWithOverride()
+        shadowOf(Looper.getMainLooper()).idleFor(Duration.ofSeconds(3))
+        assertEquals(1,vm.results.size)
+        assertEquals("Test4",vm.results.single().label)
+        assertFalse(vm.results.single().needsShotInfo)
+        assertEquals(0,vm.ble.status.value?.pendingCount)
+        vm.ble.checkLatestReading()
+        shadowOf(Looper.getMainLooper()).idle()
+        assertEquals(1,vm.results.size)
+        assertTrue(vm.results.single().linkedDraftUid.isNotBlank())
+    }
 }

@@ -21,6 +21,8 @@ import android.net.Uri
 import com.chrono.app.data.DistanceUnit
 import com.chrono.app.data.ResultStore
 import com.chrono.app.data.recoverResults
+import com.chrono.app.data.matchingDraft
+import com.chrono.app.data.withShotInfo
 import com.chrono.app.data.testResultFromJson
 import org.json.JSONArray
 import com.chrono.app.data.SessionManager
@@ -66,6 +68,10 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     val ble = ChronoBle(app)
     private val realStore = ResultStore(app, simulation = false)
     private val simStore = ResultStore(app, simulation = true)
+    private val realDraftStore = ResultStore(app, fileName = "shot_drafts.json")
+    private val simDraftStore = ResultStore(app, fileName = "shot_drafts_sim.json")
+    private val draftStore: ResultStore get() = if (ble.isSimulation) simDraftStore else realDraftStore
+    val shotDrafts = mutableStateListOf<TestResult>()
     private var browsingRealLogs = false
     private val store: ResultStore
         get() = if (browsingRealLogs) realStore else if (ble.isSimulation) simStore else realStore
@@ -428,9 +434,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun routeFirstConnection(status: DeviceStatus?) {
         if (!startupRoutingPending || ble.connState.value != ConnState.CONNECTED || status == null) return
+        if (!ble.recoveryChecked.value) return
 
         val resumeExistingRun = status.state == Proto.ST_ARMED ||
-            status.state == Proto.ST_RUNNING || status.pendingCount > 0 || startupHasShotData
+            status.state == Proto.ST_RUNNING || status.pendingCount > 0 || startupHasShotData ||
+            availableShotDrafts().isNotEmpty() || results.any { !it.accepted || it.needsShotInfo }
         startupRoutingPending = false
 
         if (resumeExistingRun) {
@@ -487,6 +495,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { ble.cal.collect { onCalReading(it) } }
         viewModelScope.launch { ble.results.collect { onRawResult(it) } }
         viewModelScope.launch { ble.traces.collect { onRawTrace(it) } }
+        viewModelScope.launch { ble.recoveryChecked.collect { if (it) routeFirstConnection(ble.status.value) } }
         viewModelScope.launch {
             ble.health.collect { health ->
                 health?.let {
@@ -527,7 +536,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                         loadDeviceReadiness()
                         reloadForMode()   // swap to this mode's isolated records
                         newShots.clear()
-                        newShots.addAll(results.filter { !it.accepted })
+                        newShots.addAll(results.filter { !it.accepted && !it.needsShotInfo })
                         routeFirstConnection(ble.status.value)
                     }
                     ConnState.DISCONNECTED ->
@@ -563,9 +572,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
                 else -> ble.reconnectLast()
             }
         }
-        // Normal launches still start at mode select. Photo capture is the one
-        // exception: the OS can recreate us after camera approval, so resume the
-        // dashboard prompt and restore whichever mode opened the camera.
+        // A killed process must reconnect even when no camera prompt was open.
+        if (photoPrompt == null && prefs.getString("uiMode", "") == "real") {
+            screen = Screen.DASHBOARD
+            ble.reconnectLast()
+        }
     }
 
     // -------------------------------------------------------------- results
@@ -592,6 +603,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         projectRefreshJob?.cancel()
         uid ?: return
         val result = results.firstOrNull { it.uid == uid } ?: return
+        if (!rememberDiscarded(result)) return
         waveformRetryJobs.remove(uid)?.cancel()
         pendingTraceUids.entries.removeAll { it.value == uid }
         traceFetchQueue.remove(uid)
@@ -616,6 +628,11 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun onRawResult(r: RawResult) {
         if (!r.crcValid) return // Keep the logger's original for a clean retransmission.
+        val key = captureKey(ble.deviceStorageKey, r.bootId, r.id, r.splitNs)
+        if (key in prefs.getStringSet("discarded_${ble.isSimulation}", emptySet()).orEmpty()) {
+            ble.sendCommand(Proto.CMD_ACK, r.id)
+            return
+        }
         startupHasShotData = true
         routeFirstConnection(ble.status.value)
 
@@ -640,68 +657,36 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             }
             return
         }
-        // Distinct retained results are real data, even if delivered in one reconnect.
-        if (session.currentTestLogged() || results.any { it.shotFolder == session.activeFolder }) {
-            session.beginNewTest()
-            pendingLabel = session.suggestedLabel()
-        }
-        val testLabel = preparePendingTestLabel()
+        val draft = matchingDraft(shotDrafts, results, ble.deviceStorageKey, r.bootId, r.id)
         run {
-            val rec = TestResult(
-                uid = UUID.randomUUID().toString(),
-                deviceResultId = r.id,
-                splitNs = r.splitNs,
-                distanceM = distanceM,
-                measurementErrorM = measurementErrorM,
-                measurementErrorUnit = measurementErrorUnit.name,
-                label = testLabel,
+            val uid = UUID.randomUUID().toString()
+            val measurement = TestResult(
+                uid = uid, deviceResultId = r.id, splitNs = r.splitNs,
+                distanceM = 0.0, label = "Recovered reading ${r.id}",
                 epochMillis = if (r.epochSec > 0) r.epochSec * 1000L else null,
-                shotType = pendingShotType.ifBlank { "Standard" },
-                tool = pendingTool.trim(),
-                disruptorLoading = pendingDisruptorLoading.trim(),
-                projectileType = pendingProjectileType.trim().ifBlank { "Water" },
-                target = pendingTarget.trim(),
-                targetDistValue = pendingTargetDistVal.replace(',', '.').toDoubleOrNull(),
-                targetDistUnit = pendingTargetDistUnit,
-                deviceSerial = ble.deviceStorageKey,
-                resultFlags = r.flags,
-                rawStartTicks = r.startTicks,
-                rawStopTicks = r.stopTicks,
-                batteryMv = r.batteryMv,
-                portFlags = r.portFlags,
-                bootId = r.bootId,
-                resetCause = r.resetCause,
-                hardwareRevision = r.hwRev,
+                deviceSerial = ble.deviceStorageKey, resultFlags = r.flags,
+                rawStartTicks = r.startTicks, rawStopTicks = r.stopTicks,
+                batteryMv = r.batteryMv, portFlags = r.portFlags,
+                bootId = r.bootId, resetCause = r.resetCause, hardwareRevision = r.hwRev,
                 firmwareVersion = if (r.fwMajor > 0) "${r.fwMajor}.${r.fwMinor}" else "",
-                formatVersion = r.formatVersion,
-                crcValid = r.crcValid,
-                accepted = false,
+                formatVersion = r.formatVersion, crcValid = r.crcValid,
+                shotFolder = "Recovered/$uid", accepted = false, needsShotInfo = true,
             )
-            rec.shotFolder = session.preparedFolder()
+            val rec = draft?.let { measurement.withShotInfo(it) } ?: measurement
             results.add(0, rec)
             if (!persist()) {
                 results.remove(rec)
                 return
             }
-            session.markCurrentTestLogged()
-            persistPublicResult(rec)
-            setupResultRecorded = true
-            prefs.edit().putBoolean(setupResultKey(), true).apply()
-            prefs.edit()
-                .putString("pendShotType", pendingShotType.ifBlank { "Standard" })
-                .putString("pendTool", pendingTool)
-                .putString("pendLoading", pendingDisruptorLoading)
-                .putString("pendProjectile", pendingProjectileType.ifBlank { "Water" })
-                .putString("pendTarget", pendingTarget)
-                .putString("pendTdVal", pendingTargetDistVal)
-                .putString("pendTdUnit", pendingTargetDistUnit)
-                .apply()
-            pendingLabel = session.suggestedLabel()   // Test2, Test3, …
-            newShots.add(rec)
-            // A real shot destroys both break-screens: force re-verify (and the
-            // sensor-attach flow re-measures the fresh screen's load).
-            setSensorReady(1, false)
-            setSensorReady(2, false)
+            if (!rec.needsShotInfo) {
+                if (session.activeFolder == rec.shotFolder) session.markCurrentTestLogged()
+                persistPublicResult(rec)
+                setupResultRecorded = true
+                prefs.edit().putBoolean(setupResultKey(), true).apply()
+                newShots.add(rec)
+                setSensorReady(1, false)
+                setSensorReady(2, false)
+            }
             if (traceCapable) {
                 retainedTraceOwners[r.id] = rec.uid
                 beginWaveformFetch(rec)
@@ -1010,6 +995,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         .put("ciPercent", accuracyEnvelopePercentFor(r))
         .put("deviceSerial", r.deviceSerial)
         .put("resultFlags", r.resultFlags)
+        .put("needsShotInfo", r.needsShotInfo)
+        .put("linkedDraftUid", r.linkedDraftUid)
         .put("rawStartTicks", r.rawStartTicks)
         .put("rawStopTicks", r.rawStopTicks)
         .put("batteryMv", r.batteryMv ?: JSONObject.NULL)
@@ -1082,6 +1069,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         (ticks - baseTicks) and 0xFFFFFFFFL
 
     private fun persistPublicResult(r: TestResult) {
+        if (r.needsShotInfo) return
         if (r.shotFolder.isBlank()) return
         val targetSession = session
         val snapshot = r.copy()
@@ -1113,6 +1101,7 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     fun deleteResult(uid: String) {
         projectRefreshJob?.cancel()
         val result = results.firstOrNull { it.uid == uid } ?: return
+        if (!rememberDiscarded(result)) return
         exportVersions.remove(uid)
         publicExportJobs.remove(uid)?.cancel()
         if (result.shotFolder.isBlank() || synchronized(session) { session.deleteTestFolder(result.shotFolder) }) {
@@ -1124,6 +1113,19 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     private fun persist(): Boolean = store.save(results.toList()).also { saved ->
         if (!saved) storageMessage =
             "Could not save the local library. Keep the logger powered on; new readings have not been acknowledged. Free storage space and tap Retry."
+    }
+
+    private fun captureKey(serial: String, boot: Long, id: Int, split: Long): String =
+        "$serial:$boot:$id:${if (boot == 0L) split else 0}"
+
+    private fun rememberDiscarded(result: TestResult): Boolean {
+        if (result.isManual) return true
+        val name = "discarded_${ble.isSimulation}"
+        val keys = prefs.getStringSet(name, emptySet()).orEmpty().toMutableSet()
+        keys.add(captureKey(result.deviceSerial, result.bootId, result.deviceResultId, result.splitNs))
+        val saved = prefs.edit().putStringSet(name, keys).commit()
+        if (!saved) storageMessage = "Could not save the discard decision. The reading was kept."
+        return saved
     }
 
     /** Per-mode namespacing so simulated calibration never touches real cal data. */
@@ -1173,6 +1175,8 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
         loadedNamespace = namespace
         val publicResults = session.loadProjectResults()
         val cachedResults = store.load()
+        shotDrafts.clear()
+        shotDrafts.addAll(draftStore.load())
         val loadedResults = mergeLoadedResults(publicResults, cachedResults)
         results.clear()
         results.addAll(loadedResults)
@@ -1525,8 +1529,12 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
 
     fun canRequestArm(): Boolean = canReloadPendingShots() && (ble.status.value?.pendingCount ?: 16) < 16
 
-    fun arm() { if (canRequestArm() && sensor1Ready && sensor2Ready) ble.sendCommand(Proto.CMD_ARM) }
-    fun armWithOverride() { if (canRequestArm()) ble.sendCommand(Proto.CMD_ARM_OVERRIDE) }
+    fun arm() {
+        if (canRequestArm() && sensor1Ready && sensor2Ready && saveArmedDraft()) ble.sendCommand(Proto.CMD_ARM)
+    }
+    fun armWithOverride() {
+        if (canRequestArm() && saveArmedDraft()) ble.sendCommand(Proto.CMD_ARM_OVERRIDE)
+    }
     /** Skipping setup never marks a sensor as verified or arms the logger. */
     fun skipRemainingTapTests() {
         if (ble.connState.value != ConnState.CONNECTED || calRunning) return
@@ -1535,7 +1543,73 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun reloadPendingShots() {
-        if (canReloadPendingShots()) ble.sendCommand(Proto.CMD_FETCH)
+        if (canReloadPendingShots()) {
+            ble.sendCommand(Proto.CMD_FETCH)
+            ble.checkLatestReading()
+        }
+    }
+
+    fun availableShotDrafts(): List<TestResult> = shotDrafts.filter { draft ->
+        results.none { it.linkedDraftUid == draft.uid || (!it.needsShotInfo && it.shotFolder == draft.shotFolder) }
+    }
+
+    private fun snapshotShotInfo(): TestResult = TestResult(
+        uid = UUID.randomUUID().toString(), deviceResultId = ble.status.value?.nextResultId ?: -1,
+        bootId = ble.status.value?.bootId ?: 0L, deviceSerial = ble.deviceStorageKey,
+        splitNs = 0, distanceM = distanceM, label = preparePendingTestLabel(),
+        epochMillis = System.currentTimeMillis(), measurementErrorM = measurementErrorM,
+        measurementErrorUnit = measurementErrorUnit.name, shotType = pendingShotType,
+        tool = pendingTool, disruptorLoading = pendingDisruptorLoading,
+        projectileType = pendingProjectileType, target = pendingTarget,
+        targetDistValue = pendingTargetDistVal.replace(',', '.').toDoubleOrNull(),
+        targetDistUnit = pendingTargetDistUnit, shotFolder = session.preparedFolder(), accepted = false,
+    )
+
+    private fun saveArmedDraft(): Boolean {
+        if (session.currentTestLogged() || results.any { !it.needsShotInfo && it.shotFolder == session.activeFolder }) {
+            session.beginNewTest()
+            pendingLabel = session.suggestedLabel()
+        }
+        val snapshot = snapshotShotInfo()
+        val previous = shotDrafts.firstOrNull {
+            it.shotFolder == snapshot.shotFolder && it.deviceSerial == snapshot.deviceSerial &&
+                it.bootId == snapshot.bootId && it.deviceResultId == snapshot.deviceResultId
+        }
+        val draft = snapshot.copy(uid = previous?.uid ?: snapshot.uid)
+        val updated = shotDrafts.filterNot { it.uid == draft.uid } + draft
+        if (!draftStore.save(updated)) {
+            storageMessage = "Could not save the test setup. The logger has not been armed. Free space and try again."
+            return false
+        }
+        shotDrafts.clear(); shotDrafts.addAll(updated)
+        return true
+    }
+
+    /** Explicitly attach a previously saved measurement; never overwrite another measurement. */
+    fun linkRecoveredReading(uid: String, draftUid: String): Boolean {
+        val index = results.indexOfFirst { it.uid == uid && it.needsShotInfo }
+        val draft = availableShotDrafts().firstOrNull { it.uid == draftUid } ?: return false
+        if (index < 0) return false
+        val old = results[index]
+        if (old.deviceSerial != draft.deviceSerial) return false
+        val linked = old.withShotInfo(draft)
+        results[index] = linked
+        if (!persist()) { results[index] = old; return false }
+        persistPublicResult(linked)
+        newShots.add(linked)
+        if (session.activeFolder == linked.shotFolder) session.markCurrentTestLogged()
+        return true
+    }
+
+    fun linkRecoveredToCurrentInfo(uid: String): Boolean {
+        if (results.none { it.uid == uid && it.needsShotInfo }) return false
+        // A fresh folder avoids taking ownership of another completed test's files.
+        if (session.currentTestLogged() || results.any { !it.needsShotInfo && it.shotFolder == session.activeFolder }) session.beginNewTest()
+        val info = snapshotShotInfo().copy(deviceSerial = results.first { it.uid == uid }.deviceSerial)
+        val updated = shotDrafts + info
+        if (!draftStore.save(updated)) { storageMessage = "Could not save shot details. Reading is still kept for later."; return false }
+        shotDrafts.add(info)
+        return linkRecoveredReading(uid, info.uid)
     }
     fun disarm() = ble.sendCommand(Proto.CMD_DISARM)
     fun syncTime() = ble.syncTime()
