@@ -14,6 +14,10 @@ template <typename Payload> class RecoveryJournal {
     Payload value;
     uint32_t checksum;
   };
+  // Keep waveform-sized work buffers off the small embedded task stack.
+  // Access is confined to setup()/loop(), never a BLE callback or ISR.
+  Slot scratch = {};
+  Slot verified = {};
   int current = -1;
   uint32_t sequence = 0;
   bool ready = false;
@@ -39,7 +43,8 @@ public:
     found = false;
     ready = InternalFS.begin();
     if (!ready) return false;
-    Slot a = {}, b = {};
+    Slot& a = scratch;
+    Slot& b = verified;
     bool av = read(0, a), bv = read(1, b);
     if (av || bv) {
       current = bv && (!av || (int32_t)(b.sequence - a.sequence) > 0) ? 1 : 0;
@@ -53,7 +58,8 @@ public:
   bool save(const Payload& value) {
     if (!ready) return false;
     int target = current == 0 ? 1 : 0;
-    Slot next = {};
+    Slot& next = scratch;
+    memset(&next, 0, sizeof(next));
     next.magic = 0x43575231UL;
     next.sequence = sequence + 1;
     next.payloadSize = sizeof(Payload);
@@ -65,7 +71,6 @@ public:
     bool written = file.write((const uint8_t*)&next, sizeof(next)) == sizeof(next);
     file.flush();
     file.close();
-    Slot verified = {};
     if (!written || !read(target, verified) || memcmp(&next, &verified, sizeof(next))) return false;
     current = target;
     sequence = next.sequence;

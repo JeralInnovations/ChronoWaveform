@@ -1,6 +1,10 @@
 # Chrono Waveform — Reviewable BLE Chronograph
 
-**Storage reliability update (2.2.0 app / 3.3 firmware):** New recordings have
+**Recovery and storage update (2.3.0 app / 3.4 firmware):** The app saves shot
+setup before arming and checks the logger's latest reading after reconnecting.
+The logger keeps its latest completed reading and full waveform in flash, even
+after acknowledgement. Unmatched readings stay available for linking later.
+New recordings have
 permanent unique folders, labels no longer rename folders, saved history survives
 partial folder scans, and the log supports search, project filters and JSON
 export/import. Read [Storage and safe updates](docs/STORAGE_AND_UPDATES.md) before
@@ -19,7 +23,9 @@ instead of having to accept the first edge-to-edge result.
 - Sensor 2 (STOP) pulls input **D1** high → the clock stops
 - The split time is captured by hardware timer logic with 62.5 ns tick resolution
 - Results survive BLE disconnects: the device stores up to 16 un-collected results
-  and the app reconnects automatically and downloads them
+  in RAM and the app reconnects automatically and downloads them. Firmware 3.4
+  additionally retains the latest completed result and waveform across a restart;
+  this single flash-backed record is replaced by the next completed capture.
 - The automatic first-edge result is preserved alongside any reviewed time
 - The app fits both traces to the screen, supports zoom/pan and snap-to-edge
   cursors, and exports the transition list

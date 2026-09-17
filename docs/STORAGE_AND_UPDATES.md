@@ -112,7 +112,7 @@ firmware override, including overriding port-health refusals; the saved result
 carries the override flag. Connection, idle-state and available-buffer checks
 still apply. Each subsequent unverified arm requires acknowledgement again.
 
-**Reload pending shots** requests the logger's unacknowledged RAM readings.
+With firmware 3.3 and earlier, **Reload pending shots** requests the logger's unacknowledged RAM readings.
 Reconnect already requests these automatically. ACK removes the device's copy
 after the app saves the reading and waveform. Therefore this is transfer
 recovery, not an archive of all past shots: acknowledged readings cannot be
@@ -126,16 +126,50 @@ they no longer evict the oldest unacknowledged reading. The ACK ring has capacit
 for all 16 results. Result ID zero remains reserved for the trace request sentinel.
 The measurement path, sensor pins and BLE packet layout are unchanged.
 
-Pending firmware results are still held in RAM. Collect them before powering off
+In firmware 3.3, pending results are held in RAM. Collect them before powering off
 or flashing the logger. Power-loss persistence in MCU flash is not part of this
-change.
+version.
+
+## Restart and latest-shot recovery (app 2.3.0 / firmware 3.4)
+
+Before ARM, the app atomically saves the shot setup, distance, folder, and expected
+device/boot/result identity as a draft. On reconnect or app restart it requests
+pending readings and reads the logger's latest completed result. **Check logger
+again** repeats this check from the dashboard.
+
+An exact, unique device/boot/result match attaches the saved draft automatically.
+Otherwise the reading and its raw waveform are saved as an unlinked recovery
+record. The Shot recovery card lets you select a saved setup, explicitly use the
+current details, or keep the reading for later. Matching does not guess from
+repeated labels or nearby times. Recovery does not require tap verification.
+
+Firmware 3.4 retains one latest completed result and its entire waveform in
+internal flash, including after ACK. Two alternating files and checksums preserve
+the previous valid copy if the next write is interrupted. The saved capture keeps
+its original boot identity. Flash failures appear in the app's recovery card.
+
+This is not a full device archive. The next completed capture replaces the latest
+record; older unacknowledged captures remain in the 16-slot RAM queue and are lost
+on power-off. Power loss before the newest flash commit can lose that newest
+capture, while leaving the previous valid copy. Firmware flashing is not a backup
+method. Keep the phone library and its full JSON/photo backups.
+
+Older firmware supports best-effort recovery from its current cached result and
+pending RAM queue, but cannot supply the new flash-backed recovery record.
+Intentionally discarded readings are remembered so automatic recovery does not
+silently restore them. Simulation remains separate from real records.
 
 ## Verification
 
 Run `gradle -p android testDebugUnitTest lintDebug assembleDebug`. Regression tests
 cover repeated labels, reset preferences, folder ownership, interrupted saves,
 partial public listings, simulation separation, duplicate result delivery,
-reconnect batches, and corrupt/truncated Bluetooth packets.
+reconnect batches, corrupt/truncated Bluetooth packets, persisted shot drafts,
+exact identity matching, and keeping raw waveforms unchanged when linking.
+
+The firmware journal test exercises complete writes, interrupted writes, reboot
+recovery, and fallback after checksum corruption using a fake filesystem. These
+tests do not substitute for a physical capture and power-cycle test on the logger.
 
 Compile the board-specific sketches with the FQBNs in `.github/workflows/build-firmware.yml`.
 Before field use, also verify on the actual phone: updating without uninstalling,
