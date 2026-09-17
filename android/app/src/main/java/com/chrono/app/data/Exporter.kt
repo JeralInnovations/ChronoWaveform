@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
 import java.io.File
+import org.json.JSONArray
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.util.Date
@@ -62,7 +63,9 @@ object Exporter {
             }
         })
 
-        val uris = arrayListOf(uriFor(context, csv))
+        val backup = File(dir, "chrono_readings_$tag$stamp.json")
+        backup.writeText(JSONArray().apply { results.forEach { put(testResultToJson(it)) } }.toString(2))
+        val uris = arrayListOf(uriFor(context, csv), uriFor(context, backup))
         val traced = results.filter { it.hasWaveform }
         if (traced.isNotEmpty()) {
             val waveformCsv = File(dir, "chrono_waveforms_$tag$stamp.csv")
@@ -97,7 +100,7 @@ object Exporter {
         }
 
         val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-            type = "text/*"
+            type = "*/*"
             putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }

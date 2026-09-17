@@ -278,8 +278,26 @@ fun SensorSetupScreen(
     //   tap      — impact/voltage-rise test (a separate check)
     var step by remember(sensor) { mutableStateOf("attach") }
     var wasVerified by remember(sensor) { mutableStateOf(false) }
+    var confirmSkip by remember(sensor) { mutableStateOf(false) }
     if (deviceState == (if (sensor == 1) Proto.ST_VERIFY1_OK else Proto.ST_VERIFY2_OK)) {
         wasVerified = true
+    }
+
+    if (confirmSkip) {
+        AlertDialog(
+            onDismissRequest = { confirmSkip = false },
+            title = { Text("Skip remaining tap tests?") },
+            text = { Text("Untested sensors will stay unverified. You can review the distance and use " +
+                "Arm without tap tests on the dashboard. A missed or invalid reading is possible. " +
+                "Skipping does not arm the logger.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmSkip = false; vm.skipRemainingTapTests() },
+                    enabled = connState == ConnState.CONNECTED && !vm.calRunning,
+                ) { Text("Skip tests") }
+            },
+            dismissButton = { TextButton(onClick = { confirmSkip = false }) { Text("Cancel") } },
+        )
     }
 
     val loadNs = vm.channelLoadNs(sensor)
@@ -450,6 +468,12 @@ fun SensorSetupScreen(
                 ) { Text(if (sensor == 1) "Continue to sensor 2" else "Continue") }
             }
         }
+        Spacer(Modifier.height(10.dp))
+        TextButton(
+            onClick = { confirmSkip = true },
+            enabled = connState == ConnState.CONNECTED && !vm.calRunning,
+            modifier = Modifier.fillMaxWidth(),
+        ) { Text("Skip remaining tap tests", color = Amber) }
     }
 }
 

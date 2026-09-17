@@ -15,6 +15,8 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.os.ParcelUuid
+import android.os.Handler
+import android.os.Looper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -38,6 +40,7 @@ object Proto {
     val INFO: UUID = UUID.fromString("a5c40007-9d95-4e4c-8c5a-c1d6f2a80de1")
     val HEALTH: UUID = UUID.fromString("a5c40008-9d95-4e4c-8c5a-c1d6f2a80de1")
     val TRACE: UUID = UUID.fromString("a5c40009-9d95-4e4c-8c5a-c1d6f2a80de1")
+    val RECOVERY: UUID = UUID.fromString("a5c4000a-9d95-4e4c-8c5a-c1d6f2a80de1")
     val CCCD: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
     const val CMD_VERIFY1: Byte = 1
@@ -88,6 +91,9 @@ data class DeviceStatus(
     val timeValid: Boolean,
     val batteryPercent: Int? = null,
     val batteryMv: Int? = null,
+    val bootId: Long? = null,
+    val nextResultId: Int? = null,
+    val recoveryStorageFailed: Boolean = false,
 ) {
     val lowBattery: Boolean
         get() = (batteryPercent != null && batteryPercent <= 15) ||
@@ -211,6 +217,8 @@ class ChronoBle(private val context: Context) {
 
     val connState = MutableStateFlow(ConnState.DISCONNECTED)
     val status = MutableStateFlow<DeviceStatus?>(null)
+    val recoveryChecked = MutableStateFlow(false)
+    val recoveryMessage = MutableStateFlow("Latest logger reading has not been checked.")
     val results = MutableSharedFlow<RawResult>(extraBufferCapacity = 32)
     val traces = MutableSharedFlow<RawTrace>(extraBufferCapacity = 16)
     val cal = MutableSharedFlow<CalReading>(extraBufferCapacity = 8)
@@ -233,6 +241,7 @@ class ChronoBle(private val context: Context) {
     private var chInfo: BluetoothGattCharacteristic? = null
     private var chHealth: BluetoothGattCharacteristic? = null
     private var chTrace: BluetoothGattCharacteristic? = null
+    private var chRecovery: BluetoothGattCharacteristic? = null
     private var smoothedBatteryMv: Int? = null
     private var smoothedBatteryPercent: Int? = null
 
@@ -251,6 +260,12 @@ class ChronoBle(private val context: Context) {
         get() = if (isSimulation) "SIM-0001"
         else hwInfo.value?.mcuSerial?.takeIf { it.isNotBlank() }
             ?: prefs.getString("lastDeviceAddress", "unknown")!!.replace(":", "")
+
+    val deviceIdentityKeys: Set<String>
+        get() = if (isSimulation) setOf("SIM-0001") else setOfNotNull(
+            hwInfo.value?.mcuSerial?.takeIf { it.isNotBlank() },
+            prefs.getString("lastDeviceAddress", null)?.replace(":", ""),
+        )
 
     fun nicknameFor(address: String): String = prefs.getString("nickname_$address", "").orEmpty()
     fun setNickname(address: String, nickname: String) {
@@ -294,11 +309,13 @@ class ChronoBle(private val context: Context) {
     fun connect(device: BluetoothDevice) {
         stopScan()
         reconnectJob?.cancel()
+        clearOperations()
+        traceAssemblies.clear()
         runCatching { gatt?.close() }
         prefs.edit().putString("lastDeviceAddress", device.address).apply()
         userDisconnected = false
         connState.value = ConnState.CONNECTING
-        gatt = device.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+        gatt = device.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, timeoutHandler)
     }
 
     fun reconnectLast(): Boolean {
@@ -322,7 +339,7 @@ class ChronoBle(private val context: Context) {
             return
         }
         userDisconnected = true
-        synchronized(opLock) { opQueue.clear(); opInFlight = false }
+        clearOperations()
         runCatching { gatt?.disconnect(); gatt?.close() }
         gatt = null
         status.value = null
@@ -359,6 +376,8 @@ class ChronoBle(private val context: Context) {
         private set
     private val simBufferedResults = mutableListOf<RawResult>()
     private val simTraces = mutableMapOf<Int, RawTrace>()
+    private var simLatest: RawResult? = null
+    private var simLatestTrace: RawTrace? = null
 
     fun connectSimulated() {
         stopScan()
@@ -366,6 +385,8 @@ class ChronoBle(private val context: Context) {
         userDisconnected = true
         runCatching { gatt?.disconnect(); gatt?.close() }
         gatt = null
+        clearOperations()
+        traceAssemblies.clear()
         isSimulation = true
         simState = Proto.ST_IDLE
         simPending = 0
@@ -373,6 +394,9 @@ class ChronoBle(private val context: Context) {
         simBarePhase = true
         simBufferedResults.clear()
         simTraces.clear()
+        simLatest = null
+        simLatestTrace = null
+        recoveryChecked.value = true
         hwInfo.value = HwInfo(2, 3, 0, 62_500, 30, 300, "SIM-0001", 2, 1, 0x000F)
         setSimFault(SimFault.NONE)
         pushSimStatus()
@@ -385,12 +409,12 @@ class ChronoBle(private val context: Context) {
         connState.value = ConnState.RECONNECTING
         reconnectJob = bleScope.launch {
             while (!userDisconnected && connState.value != ConnState.CONNECTED) {
-                synchronized(opLock) { opQueue.clear(); opInFlight = false }
+                clearOperations()
                 runCatching { gatt?.close() }
                 gatt = runCatching {
-                    device.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE)
+                    device.connectGatt(context, false, gattCb, BluetoothDevice.TRANSPORT_LE, BluetoothDevice.PHY_LE_1M_MASK, timeoutHandler)
                 }.getOrNull()
-                delay(4_000)
+                delay(15_000)
             }
         }
     }
@@ -407,7 +431,8 @@ class ChronoBle(private val context: Context) {
     }
 
     private fun pushSimStatus() {
-        status.value = DeviceStatus(simState, simPending, simTimeValid, batteryPercent = 82, batteryMv = 3990)
+        status.value = DeviceStatus(simState, simPending, simTimeValid, batteryPercent = 82, batteryMv = 3990,
+            bootId = 0x53494D31, nextResultId = simNextId)
     }
 
     fun setSimFault(fault: SimFault) {
@@ -444,12 +469,13 @@ class ChronoBle(private val context: Context) {
                 pushSimStatus()
             }
             Proto.CMD_ACK -> {
-                if (simPending > 0) simPending--
+                simBufferedResults.removeAll { it.id == arg }
+                simPending = simBufferedResults.size
                 simTraces.remove(arg)
                 pushSimStatus()
             }
             Proto.CMD_FETCH -> flushSimBufferedResults()
-            Proto.CMD_FETCH_TRACE -> simTraces[arg]?.let { traces.tryEmit(it) }
+            Proto.CMD_FETCH_TRACE -> (simTraces[arg] ?: simLatestTrace?.takeIf { it.resultId == arg })?.let { traces.tryEmit(it) }
             Proto.CMD_CALIBRATE -> simCalibrate(arg)
             Proto.CMD_HEALTH -> { setSimFault(simFault); pushSimStatus() }
             Proto.CMD_IDENTIFY -> Unit
@@ -538,8 +564,10 @@ class ChronoBle(private val context: Context) {
                 startTicks = 1000, stopTicks = 1000 + split / 62, batteryMv = 3990,
                 bootId = 0x53494D31, hwRev = 2, fwMajor = 3, formatVersion = 2)
             simTraces[result.id] = simulatedTrace(result.id, split)
+            simLatest = result
+            simLatestTrace = simTraces[result.id]
+            simBufferedResults.add(result)
             if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
-            else simBufferedResults.add(result)
             simState = Proto.ST_IDLE
             pushSimStatus()
         }
@@ -560,8 +588,8 @@ class ChronoBle(private val context: Context) {
             if (split > 0) split else 180_000L,
             reversed,
         )
+        simBufferedResults.add(result)
         if (connState.value == ConnState.CONNECTED) results.tryEmit(result)
-        else simBufferedResults.add(result)
         simState = Proto.ST_FAULT
         pushSimStatus()
     }
@@ -569,7 +597,6 @@ class ChronoBle(private val context: Context) {
     private fun flushSimBufferedResults() {
         if (!isSimulation || simBufferedResults.isEmpty()) return
         val pending = simBufferedResults.toList()
-        simBufferedResults.clear()
         for (r in pending) results.tryEmit(r)
         pushSimStatus()
     }
@@ -617,6 +644,19 @@ class ChronoBle(private val context: Context) {
     private val opLock = Any()
     private val opQueue = ArrayDeque<() -> Boolean>()
     private var opInFlight = false
+    private val timeoutHandler = Handler(Looper.getMainLooper())
+    private val operationTimeout = Runnable {
+        val device = gatt?.device
+        if (!userDisconnected && device != null) scheduleReconnect(device)
+    }
+
+    private fun clearOperations() {
+        synchronized(opLock) {
+            timeoutHandler.removeCallbacks(operationTimeout)
+            opQueue.clear()
+            opInFlight = false
+        }
+    }
 
     /** Queue a GATT call. The op returns false if it failed to start; then we move on. */
     private fun enqueue(op: () -> Boolean) {
@@ -631,13 +671,18 @@ class ChronoBle(private val context: Context) {
             val op = opQueue.removeFirstOrNull() ?: run { opInFlight = false; return }
             opInFlight = true
             val startedOk = runCatching(op).getOrDefault(false)
-            if (startedOk) return // wait for the matching onXxx callback -> opDone()
+            if (startedOk) {
+                timeoutHandler.removeCallbacks(operationTimeout)
+                timeoutHandler.postDelayed(operationTimeout, 10_000)
+                return
+            }
             // op failed to start; try the next one
         }
     }
 
     private fun opDone() {
         synchronized(opLock) {
+            timeoutHandler.removeCallbacks(operationTimeout)
             opInFlight = false
             pump()
         }
@@ -648,6 +693,7 @@ class ChronoBle(private val context: Context) {
     @Suppress("DEPRECATION")
     fun sendCommand(cmd: Byte, arg: Int = 0) {
         if (isSimulation) { simCommand(cmd, arg); return }
+        if (cmd == Proto.CMD_FETCH_TRACE) traceAssemblies.remove(arg)
         val payload = byteArrayOf(cmd, (arg and 0xFF).toByte(), ((arg shr 8) and 0xFF).toByte())
         enqueue {
             val g = gatt ?: return@enqueue false
@@ -692,6 +738,23 @@ class ChronoBle(private val context: Context) {
         }
     }
 
+    /** Read the persistent latest capture, or the legacy last-value cache. No ACK here. */
+    fun checkLatestReading() {
+        recoveryChecked.value = false
+        recoveryMessage.value = "Checking the logger's latest reading..."
+        if (isSimulation) {
+            simLatest?.let { results.tryEmit(it) }
+            recoveryChecked.value = true
+            recoveryMessage.value = "Latest logger reading checked."
+            return
+        }
+        enqueue {
+            val g = gatt ?: return@enqueue false
+            val characteristic = chRecovery ?: chResult ?: return@enqueue false
+            g.readCharacteristic(characteristic)
+        }
+    }
+
     private fun readInfo() {
         enqueue {
             val g = gatt ?: return@enqueue false
@@ -713,13 +776,18 @@ class ChronoBle(private val context: Context) {
     private val gattCb = object : BluetoothGattCallback() {
 
         override fun onConnectionStateChange(g: BluetoothGatt, statusCode: Int, newState: Int) {
+            if (g !== gatt) { g.close(); return }
+            if (statusCode != BluetoothGatt.GATT_SUCCESS) {
+                scheduleReconnect(g.device)
+                return
+            }
             when (newState) {
                 BluetoothProfile.STATE_CONNECTED -> {
-                    reconnectJob?.cancel()
-                    g.requestMtu(185)
+                    timeoutHandler.postDelayed(operationTimeout, 10_000)
+                    if (!g.requestMtu(185)) g.discoverServices()
                 }
                 BluetoothProfile.STATE_DISCONNECTED -> {
-                    synchronized(opLock) { opQueue.clear(); opInFlight = false }
+                    clearOperations()
                     traceAssemblies.clear()
                     if (userDisconnected) {
                         g.close()
@@ -737,10 +805,14 @@ class ChronoBle(private val context: Context) {
         }
 
         override fun onMtuChanged(g: BluetoothGatt, mtu: Int, status: Int) {
-            g.discoverServices()
+            if (g !== gatt) return
+            if (!g.discoverServices()) scheduleReconnect(g.device)
         }
 
         override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
+            if (g !== gatt) return
+            timeoutHandler.removeCallbacks(operationTimeout)
+            if (status != BluetoothGatt.GATT_SUCCESS) { scheduleReconnect(g.device); return }
             val svc = g.getService(Proto.SERVICE)
             if (svc == null) {
                 g.disconnect()
@@ -754,6 +826,8 @@ class ChronoBle(private val context: Context) {
             chInfo = svc.getCharacteristic(Proto.INFO)  // optional (newer firmware)
             chHealth = svc.getCharacteristic(Proto.HEALTH) // optional (protocol v2)
             chTrace = svc.getCharacteristic(Proto.TRACE)   // optional waveform stream
+            chRecovery = svc.getCharacteristic(Proto.RECOVERY)
+            recoveryChecked.value = false
             if (chStatus == null || chControl == null || chResult == null || chTime == null) {
                 g.disconnect()
                 return
@@ -763,33 +837,49 @@ class ChronoBle(private val context: Context) {
             chCal?.let { enableNotifications(it) }
             chHealth?.let { enableNotifications(it) }
             chTrace?.let { enableNotifications(it) }
-            readStatus()
             readInfo()
+            readStatus()
             readHealth()
-            syncTime()                        // sync clock on every (re)connect
-            sendCommand(Proto.CMD_FETCH)      // collect results recorded while disconnected
             enqueue {
                 prefs.edit()
                     .putString("lastSuccessfulAddress", g.device.address)
                     .putLong("lastConnectedAt_${g.device.address}", System.currentTimeMillis())
                     .apply()
+                reconnectJob?.cancel()
                 connState.value = ConnState.CONNECTED
                 false // action-only op: report "didn't start a GATT call" so the queue moves on
             }
+            syncTime()
+            sendCommand(Proto.CMD_FETCH)
+            checkLatestReading()
         }
 
-        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) = opDone()
+        override fun onDescriptorWrite(g: BluetoothGatt, d: BluetoothGattDescriptor, status: Int) {
+            if (g !== gatt) return
+            if (status == BluetoothGatt.GATT_SUCCESS) opDone() else scheduleReconnect(g.device)
+        }
 
-        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) = opDone()
+        override fun onCharacteristicWrite(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (g !== gatt) return
+            if (status == BluetoothGatt.GATT_SUCCESS) opDone() else scheduleReconnect(g.device)
+        }
 
         @Suppress("DEPRECATION")
         override fun onCharacteristicRead(g: BluetoothGatt, c: BluetoothGattCharacteristic, status: Int) {
+            if (g !== gatt) return
             if (status == BluetoothGatt.GATT_SUCCESS) c.value?.let { handleValue(c.uuid, it) }
+            if (c.uuid == Proto.RECOVERY || c.uuid == Proto.RESULT) {
+                recoveryChecked.value = true
+                recoveryMessage.value = if (status != BluetoothGatt.GATT_SUCCESS) "Latest reading check failed. Tap Check logger again."
+                    else if (chRecovery == null) "Latest reading checked. This older firmware only keeps a RAM copy."
+                    else "Latest reading checked. Firmware retains its latest capture across restarts."
+            }
             opDone()
         }
 
         @Suppress("DEPRECATION")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
+            if (g !== gatt) return
             c.value?.let { handleValue(c.uuid, it) }
         }
     }
@@ -824,35 +914,12 @@ class ChronoBle(private val context: Context) {
                     timeValid = v[2].toInt() != 0,
                     batteryPercent = batteryPercent,
                     batteryMv = batteryMv,
+                    bootId = if (v.size >= 13) ByteBuffer.wrap(v, 7, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xffffffffL else null,
+                    nextResultId = if (v.size >= 13) ByteBuffer.wrap(v, 11, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt() and 0xffff else null,
+                    recoveryStorageFailed = v.size >= 14 && v[13].toInt() and 1 != 0,
                 )
             }
-            Proto.RESULT -> if (v.size >= 11) {
-                val b = ByteBuffer.wrap(v).order(ByteOrder.LITTLE_ENDIAN)
-                val id = b.short.toInt() and 0xFFFF
-                val splitNs = b.int.toLong() and 0xFFFFFFFFL
-                val epochSec = b.int.toLong() and 0xFFFFFFFFL
-                val flags = b.get().toInt() and 0xFF
-                if (v.size >= 37) {
-                    val startTicks = b.int.toLong() and 0xFFFFFFFFL
-                    val stopTicks = b.int.toLong() and 0xFFFFFFFFL
-                    val batteryMv = (b.short.toInt() and 0xFFFF).takeUnless { it == 0xFFFF }
-                    val portFlags = b.short.toInt() and 0xFFFF
-                    val bootId = b.int.toLong() and 0xFFFFFFFFL
-                    val resetCause = b.int.toLong() and 0xFFFFFFFFL
-                    val hwRev = b.get().toInt() and 0xFF
-                    val fwMajor = b.get().toInt() and 0xFF
-                    val fwMinor = b.get().toInt() and 0xFF
-                    val formatVersion = b.get().toInt() and 0xFF
-                    val packetCrc = b.short.toInt() and 0xFFFF
-                    results.tryEmit(
-                        RawResult(id, splitNs, epochSec, flags, startTicks, stopTicks,
-                            batteryMv, portFlags, bootId, resetCause, hwRev, fwMajor,
-                            fwMinor, formatVersion, packetCrc == crc16Ccitt(v, 35))
-                    )
-                } else {
-                    results.tryEmit(RawResult(id, splitNs, epochSec, flags))
-                }
-            }
+            Proto.RESULT, Proto.RECOVERY -> ResultPacket.decode(v)?.takeIf { it.id > 0 }?.let { results.tryEmit(it) }
             Proto.TRACE -> if (v.size >= 18) {
                 val payloadLength = v.size - 2
                 val packetCrc = (v[payloadLength].toInt() and 0xFF) or
@@ -875,14 +942,15 @@ class ChronoBle(private val context: Context) {
                     ((v[14].toLong() and 0xFF) shl 16) or
                     ((v[15].toLong() and 0xFF) shl 24)
 
-                if (chunkCount == 0 || chunkIndex >= chunkCount ||
+                if (formatVersion != 1 || totalEvents > 512 || chunkCount !in 1..32 || chunkIndex >= chunkCount ||
                     eventStart + eventCount > totalEvents ||
                     v.size != 18 + eventCount * 4) return
 
                 val existing = traceAssemblies[resultId]
                 val assembly = if (existing == null ||
                     existing.events.size != totalEvents ||
-                    existing.chunkCount != chunkCount
+                    existing.chunkCount != chunkCount || existing.baseTicks != baseTicks ||
+                    existing.flags != traceFlags || existing.formatVersion != formatVersion
                 ) {
                     TraceAssembly(
                         formatVersion, traceFlags, baseTicks, chunkCount,

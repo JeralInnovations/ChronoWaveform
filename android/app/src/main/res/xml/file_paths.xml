@@ -2,4 +2,7 @@
 <paths>
     <files-path name="exports" path="exports/" />
     <external-files-path name="chronodata" path="ChronoData/" />
+    <external-files-path name="chronodata_simulation" path="ChronoData_SIMULATION/" />
+    <files-path name="chronodata_fallback" path="ChronoData/" />
+    <files-path name="chronodata_simulation_fallback" path="ChronoData_SIMULATION/" />
 </paths>

@@ -38,6 +38,16 @@ fun ChronoApp(vm: ChronoViewModel) {
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
+    vm.storageMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { vm.dismissStorageMessage() },
+            title = { Text("Storage needs attention") },
+            text = { Text(message) },
+            confirmButton = { TextButton(onClick = { vm.retryStorage() }) { Text("Retry") } },
+            dismissButton = { TextButton(onClick = { vm.dismissStorageMessage() }) { Text("Close") } },
+        )
+    }
+
     // New day (or first run): name a project folder, or keep the previous one.
     if (vm.projectPrompt && vm.screen != Screen.SAVED_LOGS) {
         var name by remember { mutableStateOf(vm.defaultProjectName()) }
