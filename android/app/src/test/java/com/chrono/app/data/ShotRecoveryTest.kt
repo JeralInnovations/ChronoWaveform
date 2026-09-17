@@ -13,7 +13,7 @@ class ShotRecoveryTest {
     private fun draft() = TestResult("draft-4", 4, 0, 0.25, "Test4", 1234, deviceSerial="logger-a", bootId=42, shotFolder="project/Test4--uuid", tool="saved tool")
 
     @Test fun persistedSetupCanBeMatchedAfterProcessRestart() {
-        val context = RuntimeEnvironment.getApplication<android.app.Application>()
+        val context = RuntimeEnvironment.getApplication()
         assertTrue(ResultStore(context,fileName="shot_drafts.json").save(listOf(draft())))
         val reloaded = ResultStore(context,fileName="shot_drafts.json").load()
         assertEquals("draft-4",matchingDraft(reloaded,emptyList(),"logger-a",42,4)?.uid)
