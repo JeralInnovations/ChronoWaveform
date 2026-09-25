@@ -1219,9 +1219,9 @@ class ChronoViewModel(app: Application) : AndroidViewModel(app) {
             results.clear()
             results.addAll(loadedResults)
             persist()
-            val generatedLabel = Regex("^Test[0-9]+$", RegexOption.IGNORE_CASE)
-                .matches(pendingLabel.trim())
-            if (pendingLabel.isBlank() || generatedLabel) {
+            // A media scan may finish after the operator edits the next label.
+            // Even a label like Test4 is user input; refresh must not replace it.
+            if (pendingLabel.isBlank()) {
                 pendingLabel = activeSession.suggestedLabel()
             }
             photoRevision++
