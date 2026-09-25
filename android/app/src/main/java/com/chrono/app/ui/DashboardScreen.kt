@@ -579,7 +579,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                         )
                         Row(verticalAlignment = Alignment.Bottom) {
                             Text(
-                                "%.1f%s".format(s.feetPerSecond, s.reversedMarker),
+                                if (s.hasReportableVelocity) "%.1f%s".format(s.feetPerSecond, s.reversedMarker) else "—",
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 26.sp,
                                 color = Amber,
@@ -594,7 +594,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                             )
                         }
                         Text(
-                            "%.2f m/s".format(s.metersPerSecond),
+                            s.measurementInvalidReason.ifBlank { if (s.excludedFromReport) "Excluded record" else "Velocity in feet per second" },
                             color = TextDim,
                             style = MaterialTheme.typography.bodyMedium,
                         )
