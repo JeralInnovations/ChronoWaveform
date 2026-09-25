@@ -1152,7 +1152,7 @@ private fun FullLogDialog(
                 Column(Modifier.weight(1f)) {
                     Text(title, style = MaterialTheme.typography.headlineMedium, color = Amber)
                     Text(
-                        "${visible.size} of ${vm.results.size} results",
+                        "${visible.count { !it.excludedFromReport }} shots · ${visible.count { it.excludedFromReport }} excluded records",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextDim,
                     )
@@ -1945,7 +1945,7 @@ private fun ResultCard(
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        if (r.metersPerSecond != 0.0) {
+                        if (r.hasReportableVelocity) {
                             "%.1f%s".format(r.feetPerSecond, r.reversedMarker)
                         } else {
                             "—"
@@ -1961,12 +1961,11 @@ private fun ResultCard(
                 val envelopeText = if (accuracyEnvelopePercent >= 0.05)
                     "+/- %.1f%% GAE".format(accuracyEnvelopePercent) else "+/- <0.1% GAE"
                 val detail = when {
-                    r.isManual && r.metersPerSecond != 0.0 ->
-                        "%.2f m/s  ·  manual entry".format(r.metersPerSecond)
-                    r.isManual -> "manual entry"
-                    else -> "%.2f%s m/s  -  %s  -  %s".format(
-                        r.metersPerSecond, r.reversedMarker, r.splitTimeText(), envelopeText
-                    )
+                    r.excludedFromReport -> "Excluded from shot count and report results"
+                    r.measurementInvalidReason.isNotBlank() -> "Invalid chrono reading: ${r.measurementInvalidReason}"
+                    r.isManual -> "Manual entry" + if (r.hasReportableVelocity) "" else " · no chrono velocity"
+                    r.needsShotInfo -> "Awaiting shot details"
+                    else -> "${r.splitTimeText()} · $envelopeText"
                 }
                 Text(
                     detail,
@@ -2334,7 +2333,7 @@ private fun EditResultDialog(
                         DistanceUnit.valueOf(result.measurementErrorUnit)
                     }.getOrDefault(DistanceUnit.INCHES)
                     val measurementError = result.measurementErrorM / errorUnit.toMeters
-                    val velocityText = if (result.metersPerSecond != 0.0) {
+                    val velocityText = if (result.hasReportableVelocity) {
                         "%.1f%s ft/s".format(result.feetPerSecond, result.reversedMarker)
                     } else {
                         "Not recorded"

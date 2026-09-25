@@ -69,7 +69,12 @@ data class TestResult(
     /** A recovered measurement with no proven association to shot setup. */
     var needsShotInfo: Boolean = false,
     var linkedDraftUid: String = "",
+    /** Operator classification; raw timing and waveform remain unchanged. */
+    var measurementInvalidReason: String = "",
+    var excludedFromReport: Boolean = false,
 ) {
+    val hasReportableVelocity: Boolean get() =
+        measurementInvalidReason.isBlank() && !excludedFromReport && !needsShotInfo && metersPerSecond != 0.0
     val isManual: Boolean get() = deviceResultId < 0
     val isReversed: Boolean get() = resultFlags and 0x04 != 0 && splitNs > 0
     val signedSplitNs: Long get() = if (isReversed) -abs(splitNs) else splitNs
@@ -222,6 +227,8 @@ internal fun testResultFromJson(
         accepted = o.optBoolean("accepted", true),
         needsShotInfo = o.optBoolean("needsShotInfo", false),
         linkedDraftUid = o.optString("linkedDraftUid", ""),
+        measurementInvalidReason = o.optString("measurementInvalidReason", ""),
+        excludedFromReport = o.optBoolean("excludedFromReport", false),
     )
 }
 
@@ -304,6 +311,8 @@ internal fun testResultToJson(r: TestResult): JSONObject =
         .put("shotFolder", r.shotFolder)
         .put("thumbnailUri", r.thumbnailUri)
         .put("accepted", r.accepted)
+        .put("measurementInvalidReason", r.measurementInvalidReason)
+        .put("excludedFromReport", r.excludedFromReport)
         .apply {
             r.targetDistValue?.let { put("targetDistValue", it) }
             r.manualVelocityMps?.let { put("manualVelocityMps", it) }

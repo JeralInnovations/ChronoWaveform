@@ -47,7 +47,7 @@ try {
         if (!$ApkSignerCommand) { throw 'Supply -ApkSignerCommand with the Android SDK apksigner path.' }
         $artifactDirectory = Join-Path $projectRoot 'artifacts'
         New-Item -ItemType Directory -Path $artifactDirectory -Force | Out-Null
-        $outputApk = Join-Path $artifactDirectory 'ChronoWaveform-2.3.0.apk'
+        $outputApk = Join-Path $artifactDirectory 'ChronoWaveform-2.3.1.apk'
         & $ApkSignerCommand sign --ks $keyPath --ks-key-alias $credentials.alias `
             --ks-pass env:CHRONO_KEYSTORE_PASSWORD --key-pass env:CHRONO_KEY_PASSWORD `
             --out $outputApk $UnsignedApk

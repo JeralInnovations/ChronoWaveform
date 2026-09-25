@@ -10,6 +10,22 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [28])
 class ShotRecoveryTest {
+    @Test fun invalidAndBenchRecordsKeepEditableDataWithoutReportingVelocity() {
+        val original=TestResult("capture",1,100000,0.25,"Test",1234,
+            traceData="raw-waveform",traceFormatVersion=1,reviewedSplitNs=90000,
+            reviewedStartOffsetTicks=3,reviewedStopOffsetTicks=1443)
+        assertTrue(original.hasReportableVelocity)
+        val invalid=testResultFromJson(testResultToJson(original.copy(measurementInvalidReason="Missed stop sensor")))
+        assertFalse(invalid.hasReportableVelocity)
+        assertEquals("Missed stop sensor",invalid.measurementInvalidReason)
+        assertEquals(original.traceData,invalid.traceData)
+        assertEquals(original.reviewedSplitNs,invalid.reviewedSplitNs)
+        assertEquals(original.reviewedStopOffsetTicks,invalid.reviewedStopOffsetTicks)
+        val bench=testResultFromJson(testResultToJson(original.copy(excludedFromReport=true)))
+        assertTrue(bench.excludedFromReport)
+        assertFalse(bench.hasReportableVelocity)
+        assertFalse(original.copy(deviceResultId=-1,splitNs=0,reviewedSplitNs=null,distanceM=0.0).hasReportableVelocity)
+    }
     private fun draft() = TestResult("draft-4", 4, 0, 0.25, "Test4", 1234, deviceSerial="logger-a", bootId=42, shotFolder="project/Test4--uuid", tool="saved tool")
 
     @Test fun persistedSetupCanBeMatchedAfterProcessRestart() {

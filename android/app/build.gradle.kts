@@ -12,8 +12,8 @@ android {
         applicationId = "com.chrono.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "2.3.0-shot-recovery"
+        versionCode = 12
+        versionName = "2.3.1-log-review"
     }
 
     val keystorePath = System.getenv("CHRONO_KEYSTORE_FILE")
