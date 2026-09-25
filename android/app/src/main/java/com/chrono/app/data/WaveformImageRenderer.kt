@@ -89,15 +89,17 @@ object WaveformImageRenderer {
         )
         text.textSize = 32f
         canvas.drawText(
-            "Delta ${formatTime(selectedNs)}    %.2f m/s    %.1f ft/s"
-                .format(Locale.US, result.metersPerSecond, result.feetPerSecond),
+            "Delta ${formatTime(selectedNs)}    " + if (result.hasReportableVelocity)
+                "%.1f ft/s".format(Locale.US, result.feetPerSecond) else "Velocity unavailable",
             70f, 836f, text,
         )
         dim.textSize = 22f
         val velocityError = abs(result.feetPerSecond) * accuracyEnvelopePercent / 100.0
         canvas.drawText(
-            "Distance %.4f m    Estimated error +/- %.2f%% GAE (+/- %.1f ft/s)"
-                .format(Locale.US, result.distanceM, accuracyEnvelopePercent, velocityError),
+            if (result.hasReportableVelocity)
+                "Distance %.4f m    Estimated error +/- %.2f%% GAE (+/- %.1f ft/s)"
+                    .format(Locale.US, result.distanceM, accuracyEnvelopePercent, velocityError)
+            else result.measurementInvalidReason.ifBlank { "Excluded from reported velocity; original trace retained." },
             72f, 872f, dim,
         )
 

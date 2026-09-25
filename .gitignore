@@ -13,3 +13,9 @@ android/.kotlin/
 *.apk
 *.hprof
 .DS_Store
+.tools/
+artifacts/
+
+*.jks
+*.keystore
+keystore.properties

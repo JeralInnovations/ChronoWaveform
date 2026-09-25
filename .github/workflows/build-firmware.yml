@@ -1,11 +1,22 @@
 name: Compile firmware
 
 on:
+  pull_request:
   push:
     branches: [main]
   workflow_dispatch:
 
 jobs:
+  journal-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test interrupted writes and recovery
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -Ifirmware/tests/stubs firmware/tests/recovery_journal_test.cpp -o /tmp/recovery-test
+          /tmp/recovery-test
+          cmp firmware/ChronographXiao/RecoveryJournal.h firmware/ChronographNiceNano/RecoveryJournal.h
+          cmp firmware/ChronographXiao/RecoveryJournal.h firmware/Chronograph/RecoveryJournal.h
   nice-nano:
     runs-on: ubuntu-latest
     steps:
@@ -16,7 +27,7 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.12"
 
       - name: Install adafruit-nrfutil (DFU packaging tool the core invokes)
         run: pip install adafruit-nrfutil
@@ -27,13 +38,19 @@ jobs:
           arduino-cli config add board_manager.additional_urls \
             https://raw.githubusercontent.com/JeralInnovations/nicenano-v2-arduino/master/package_nicenano_index.json
           arduino-cli core update-index
-          arduino-cli core install nicenano:nrf52
+          arduino-cli core install nicenano:nrf52@2.0.1
 
       - name: Compile nice!nano sketch
         run: |
           arduino-cli compile \
             --fqbn nicenano:nrf52:nicenanov2pf \
+            --output-dir build/firmware-nice-nano \
             firmware/ChronographNiceNano
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-nice-nano
+          path: build/firmware-nice-nano/
 
   xiao:
     runs-on: ubuntu-latest
@@ -52,10 +69,16 @@ jobs:
           arduino-cli config add board_manager.additional_urls \
             https://files.seeedstudio.com/arduino/package_seeeduino_boards_index.json
           arduino-cli core update-index
-          arduino-cli core install Seeeduino:nrf52
+          arduino-cli core install Seeeduino:nrf52@1.1.13
 
       - name: Compile XIAO sketch
         run: |
           arduino-cli compile \
             --fqbn Seeeduino:nrf52:xiaonRF52840 \
+            --output-dir build/firmware-xiao \
             firmware/ChronographXiao
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: firmware-xiao
+          path: build/firmware-xiao/

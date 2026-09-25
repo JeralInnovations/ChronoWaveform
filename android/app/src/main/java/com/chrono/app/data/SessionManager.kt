@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.util.AtomicFile
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import androidx.core.content.FileProvider
@@ -14,6 +15,7 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 /**
  * Folder-based logging in PUBLIC storage so the user can browse it with any
@@ -21,9 +23,9 @@ import java.util.Locale
  *
  *   Documents/ChronoData/
  *     2026-07-06/                <- PROJECT folder, one per day (renameable at
- *       Test1/                      creation via the new-day prompt)
- *         shot.json              <- TEST subfolder, named by the test label or
- *         setup_*.jpg, after_*      Test1/Test2/… auto-incrementing
+ *       Test1--<uuid>/              creation via the new-day prompt)
+ *         shot.json              <- immutable TEST folder; editable label in JSON
+ *         setup_*.jpg, after_*      display labels can repeat
  *       LongRangeGroupA/
  *
  * A new day (or first run) prompts for the project folder; within a day every
@@ -50,6 +52,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         private set
     private var projectDay: String? = prefs.getString("projectDay", null)
     private var currentTestRel: String? = prefs.getString("currentTestRel", null)
+    private var currentTestLabel: String? = prefs.getString("currentTestLabel", null)
     private var shotLogged: Boolean = prefs.getBoolean("shotLogged", false)
 
     fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
@@ -59,15 +62,16 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
 
     /** The active test folder remains authoritative through its after photos. */
     fun suggestedLabel(): String =
-        currentTestRel?.substringAfterLast('/')
-            ?: nextGeneratedLabel()
+        currentTestLabel ?: currentTestRel?.substringAfterLast('/') ?: nextGeneratedLabel()
 
-    val pathLabel: String get() = "Documents/$rootDir/${projectName ?: ""}"
+    val pathLabel: String get() = if (useMediaStore) "Documents/$rootDir/${projectName ?: ""}"
+        else "Android/data/${context.packageName}/files/$rootDir/${projectName ?: ""}"
 
     fun startProject(name: String) {
-        projectName = sanitize(name.ifBlank { today() })
+        projectName = sanitize(name).ifBlank { today() }
         projectDay = today()
         currentTestRel = null
+        currentTestLabel = null
         shotLogged = false
         save()
     }
@@ -85,8 +89,11 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
     private fun rollTest(label: String) {
         ensureProject()
         val base = sanitize(label).ifBlank { nextGeneratedLabel() }
-        val name = uniqueName(base)
+        // A provider may hide older files after reinstall. Visibility is never identity.
+        val name = "$base--${UUID.randomUUID()}"
+        currentTestLabel = base
         currentTestRel = "$projectName/$name"
+        reserve(currentTestRel!!)
         shotLogged = false
         save()
     }
@@ -104,40 +111,27 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
      */
     fun beginNewTest() {
         currentTestRel = null
+        currentTestLabel = null
         shotLogged = false
         save()
     }
 
     /** Open the test if needed and return the exact folder/label name selected. */
     fun prepareTestLabel(label: String): String {
-        val rel = currentTest(label)
-        return rel.substringAfterLast('/')
+        currentTest(label)
+        return suggestedLabel()
     }
 
-    /**
-     * Rename a test folder and return its effective relative path and label.
-     * MediaStore item ids are retained, so existing photo URIs remain valid.
-     */
+    /** Edit the display label without moving files or changing photo ownership. */
     fun renameTestFolder(rel: String, label: String): Pair<String, String> {
-        if (rel.isBlank()) return rel to sanitize(label)
-        val oldName = rel.substringAfterLast('/')
-        val requested = sanitize(label).ifBlank { oldName }
-        if (oldName == requested) return rel to oldName
-
-        val project = rel.substringBeforeLast('/')
-        val newName = if (project == projectName) {
-            uniqueName(requested, excluding = oldName)
-        } else {
-            requested
+        val effective = sanitize(label).ifBlank {
+            if (rel == currentTestRel) suggestedLabel() else rel.substringAfterLast('/').substringBefore("--")
         }
-        val newRel = "$project/$newName"
-        if (!moveTestFolder(rel, newRel)) return rel to oldName
-
-        if (currentTestRel == rel) {
-            currentTestRel = newRel
+        if (rel == currentTestRel) {
+            currentTestLabel = effective
             save()
         }
-        return newRel to newName
+        return rel to effective
     }
 
     /** Folder for the active test cycle. Only beginNewTest() advances it. */
@@ -150,18 +144,27 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         return currentTestRel!!
     }
 
-    fun currentTestLogged(): Boolean = shotLogged
+    fun currentTestLogged(): Boolean = shotLogged || currentTestRel?.let { rel ->
+        if (useMediaStore) findUriAt(rel, "shot.json") != null
+        else File(context.getExternalFilesDir(null) ?: context.filesDir, "$rootDir/$rel/shot.json").exists()
+    } == true
+
+    val activeFolder: String? get() = currentTestRel
+
+    fun preparedFolder(): String = checkNotNull(currentTestRel)
+
+    fun markCurrentTestLogged() { shotLogged = true; save() }
 
     /** Setup photos open/join the upcoming test; after photos stay with it. */
     fun newPhotoUri(kind: String, label: String): Uri? {
         val rel = writablePhotoRel(kind, label)
-        return createUriAt(rel, "${kind}_${System.currentTimeMillis()}.jpg", "image/jpeg")
+        return createUriAt(rel, "${kind}_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg", "image/jpeg")
     }
 
     /** Create a photo directly inside a result's immutable owning folder. */
     fun newPhotoUriInFolder(rel: String, kind: String): Uri? =
         rel.takeIf { it.isNotBlank() }?.let {
-            createUriAt(it, "${kind}_${System.currentTimeMillis()}.jpg", "image/jpeg")
+            createUriAt(it, "${kind}_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg", "image/jpeg")
         }
 
     fun listPromptPhotos(kind: String, label: String): List<Uri> =
@@ -180,9 +183,9 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
     /** Writes the log into its test folder; returns the folder id for the record. */
     fun logShot(label: String, json: JSONObject): String {
         val rel = currentTest(label)
-        json.put("label", rel.substringAfterLast('/'))
+        json.put("label", suggestedLabel())
         json.put("shotFolder", rel)
-        writeShotJson(rel, json)
+        check(writeShotJson(rel, json)) { "Could not save the test file" }
         shotLogged = true
         save()
         return rel
@@ -237,17 +240,19 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
     fun folderForResult(existingRel: String?, uidHint: String): String {
         if (!existingRel.isNullOrBlank()) return existingRel
         ensureProject()
-        return "$projectName/Extra_${uidHint.take(8)}"
+        return "$projectName/Extra_$uidHint"
     }
 
     fun importPhoto(rel: String, source: Uri): Boolean {
-        val dest = createUriAt(rel, "attached_${System.currentTimeMillis()}.jpg", "image/jpeg")
+        val dest = createUriAt(rel, "attached_${System.currentTimeMillis()}_${UUID.randomUUID()}.jpg", "image/jpeg")
             ?: return false
-        return runCatching {
+        val copied = runCatching {
             context.contentResolver.openInputStream(source)!!.use { input ->
                 context.contentResolver.openOutputStream(dest)!!.use { out -> input.copyTo(out) }
             }
         }.isSuccess
+        if (!copied) deletePhoto(dest)
+        return copied
     }
 
     fun deletePhoto(uri: Uri): Boolean =
@@ -293,10 +298,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         }
     }
 
-    /**
-     * Read the active project from public storage. Folder names are authoritative
-     * for labels, while every other field comes from that folder's shot.json.
-     */
+    /** Discover readable public copies. The scan does not change session ownership. */
     fun loadProjectResults(): List<TestResult> {
         // The app log is a history, not just the currently active project.
         // Scan every public project so reinstalling the app or starting a new
@@ -308,36 +310,15 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
             .values
             .mapNotNull { files -> files.maxByOrNull { it.modifiedAt } }
 
-        val activeBeforeScan = currentTestRel
-        var renamedActiveFolder: String? = null
         val parsed = jsonFiles.mapNotNull { stored ->
             runCatching {
                 val json = JSONObject(readStoredText(stored))
-                if (activeBeforeScan != null &&
-                    stored.relativeFolder.substringBefore('/') == projectName &&
-                    stored.relativeFolder != activeBeforeScan
-                ) {
-                    val oldLabel = activeBeforeScan.substringAfterLast('/')
-                    if (json.optString("shotFolder") == activeBeforeScan ||
-                        json.optString("label") == oldLabel
-                    ) {
-                        renamedActiveFolder = stored.relativeFolder
-                    }
-                }
                 testResultFromJson(
                     o = json,
                     folder = stored.relativeFolder,
-                    folderLabel = stored.folderName,
+                    folderLabel = json.optString("label").ifBlank { stored.folderName.substringBefore("--") },
                 ) to stored.modifiedAt
             }.getOrNull()
-        }
-        if (activeBeforeScan != null &&
-            allFiles.none { it.relativeFolder == activeBeforeScan } &&
-            renamedActiveFolder != null
-        ) {
-            currentTestRel = renamedActiveFolder
-            shotLogged = true
-            save()
         }
         return parsed.sortedWith(
             compareByDescending<Pair<TestResult, Long>> {
@@ -463,8 +444,17 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
             stored.file!!.readText()
         }
 
+    private fun reserve(rel: String) {
+        val names = prefs.getStringSet("reservedFolders", emptySet()).orEmpty().toMutableSet()
+        names.add(rel)
+        prefs.edit().putStringSet("reservedFolders", names).apply()
+    }
+
     private fun existingTestNames(): Set<String> =
-        projectFiles().mapTo(linkedSetOf()) { it.folderName }
+        projectFiles().mapTo(linkedSetOf()) { it.folderName } +
+            prefs.getStringSet("reservedFolders", emptySet()).orEmpty()
+                .filter { it.substringBeforeLast('/') == projectName }
+                .map { it.substringAfterLast('/') }
 
     private fun nextGeneratedLabel(): String {
         val names = existingTestNames()
@@ -476,11 +466,26 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
 
     private fun testNumber(label: String): Int? =
         Regex("^Test([0-9]+)$", RegexOption.IGNORE_CASE)
-            .matchEntire(label)?.groupValues?.get(1)?.toIntOrNull()
+            .matchEntire(label.substringBefore("--"))?.groupValues?.get(1)?.toIntOrNull()
 
     // ------------------------------------------------------------------ helpers
 
     private fun writeShotJson(rel: String, json: JSONObject): Boolean {
+        val previous = runCatching {
+            if (useMediaStore) {
+                findUriAt(rel, "shot.json")?.let { uri ->
+                    context.contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+                        ?: error("Cannot read existing recording")
+                }
+            } else {
+                File(context.getExternalFilesDir(null) ?: context.filesDir, "$rootDir/$rel/shot.json")
+                    .takeIf { it.exists() }?.readText()
+            }
+        }.getOrElse { return false }
+        if (previous != null) {
+            val prior = runCatching { JSONObject(previous) }.getOrNull() ?: return false
+            if (testResultFromJson(prior, folder = rel).uid != json.optString("uid")) return false
+        }
         return writeJsonFile(rel, "shot.json", json)
     }
 
@@ -498,7 +503,16 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
             val dir = File(context.getExternalFilesDir(null) ?: context.filesDir, "$rootDir/$rel")
             return runCatching {
                 dir.mkdirs()
-                File(dir, name).writeBytes(bytes)
+                val atomic = AtomicFile(File(dir, name))
+                val out = atomic.startWrite()
+                try {
+                    out.write(bytes)
+                    out.fd.sync()
+                    atomic.finishWrite(out)
+                } catch (error: Exception) {
+                    atomic.failWrite(out)
+                    throw error
+                }
             }.isSuccess
         }
 
@@ -551,65 +565,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
         }
 
     private fun sanitize(s: String): String =
-        s.trim().replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001f]"), "_").take(40).trim()
-
-    private fun uniqueName(base: String, excluding: String? = null): String {
-        val used = existingTestNames().filterNot {
-            excluding != null && it.equals(excluding, ignoreCase = true)
-        }
-        if (used.none { it.equals(base, ignoreCase = true) }) return base
-        var i = 2
-        while (used.any { it.equals("${base}_$i", ignoreCase = true) }) i++
-        return "${base}_$i"
-    }
-
-    private fun moveTestFolder(oldRel: String, newRel: String): Boolean {
-        if (oldRel == newRel) return true
-        if (!useMediaStore) {
-            val root = context.getExternalFilesDir(null) ?: context.filesDir
-            val oldDir = File(root, "$rootDir/$oldRel")
-            val newDir = File(root, "$rootDir/$newRel")
-            if (!oldDir.exists()) return true
-            newDir.parentFile?.mkdirs()
-            return oldDir.renameTo(newDir)
-        }
-
-        val resolver = context.contentResolver
-        val collection = MediaStore.Files.getContentUri("external")
-        val oldPath = "Documents/$rootDir/$oldRel/"
-        val newPath = "Documents/$rootDir/$newRel/"
-        val ids = mutableListOf<Long>()
-        val queried = runCatching {
-            resolver.query(
-                collection,
-                arrayOf(MediaStore.MediaColumns._ID),
-                "${MediaStore.MediaColumns.RELATIVE_PATH}=?",
-                arrayOf(oldPath),
-                null,
-            )?.use { cursor ->
-                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
-                while (cursor.moveToNext()) ids.add(cursor.getLong(idColumn))
-            }
-        }
-        if (queried.isFailure) return false
-
-        val moved = mutableListOf<Uri>()
-        for (id in ids) {
-            val uri = ContentUris.withAppendedId(collection, id)
-            val values = ContentValues().apply {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, newPath)
-            }
-            if (runCatching { resolver.update(uri, values, null, null) }.getOrDefault(0) != 1) {
-                val rollback = ContentValues().apply {
-                    put(MediaStore.MediaColumns.RELATIVE_PATH, oldPath)
-                }
-                moved.forEach { runCatching { resolver.update(it, rollback, null, null) } }
-                return false
-            }
-            moved.add(uri)
-        }
-        return true
-    }
+        s.trim().replace(Regex("[/\\\\:*?\"<>|\\u0000-\\u001f]"), "_").take(40).trim().trim('.')
 
     /** Best-effort: open the data folder in the system Files app. */
     fun openFolder(context: Context) {
@@ -637,6 +593,7 @@ class SessionManager(private val context: Context, simulation: Boolean = false) 
             .putString("projectName", projectName)
             .putString("projectDay", projectDay)
             .putString("currentTestRel", currentTestRel)
+            .putString("currentTestLabel", currentTestLabel)
             .putBoolean("shotLogged", shotLogged)
             .apply()
     }

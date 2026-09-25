@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import androidx.core.content.FileProvider
 import java.io.File
+import org.json.JSONArray
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.util.Date
@@ -31,7 +32,7 @@ object Exporter {
                     "timing_fault,split_time,automatic_split_ns,reviewed_split_ns,effective_split_ns," +
                     "split_ms,distance_m,measurement_error_m,measurement_error_unit," +
                     "velocity_mps,velocity_fps,waveform_reviewed," +
-                    "trace_format,trace_flags,trace_event_count"
+                    "trace_format,trace_flags,trace_event_count,excluded_from_report,measurement_invalid_reason"
             )
             for (r in results) {
                 val date = r.epochMillis?.let { Instant.ofEpochMilli(it).toString() } ?: ""
@@ -54,15 +55,18 @@ object Exporter {
                         String.format(Locale.US, "%.5f", r.distanceM) + "," +
                         String.format(Locale.US, "%.5f", r.measurementErrorM) + "," +
                         r.measurementErrorUnit + "," +
-                        String.format(Locale.US, "%.3f", r.metersPerSecond) + "," +
-                        String.format(Locale.US, "%.2f", r.feetPerSecond) + "," +
+                        (if (r.hasReportableVelocity) String.format(Locale.US, "%.3f", r.metersPerSecond) else "") + "," +
+                        (if (r.hasReportableVelocity) String.format(Locale.US, "%.2f", r.feetPerSecond) else "") + "," +
                         r.isWaveformReviewed + "," + r.traceFormatVersion + "," +
-                        r.traceFlags + "," + r.waveformEvents().size
+                        r.traceFlags + "," + r.waveformEvents().size + "," +
+                        r.excludedFromReport + "," + esc(r.measurementInvalidReason)
                 )
             }
         })
 
-        val uris = arrayListOf(uriFor(context, csv))
+        val backup = File(dir, "chrono_readings_$tag$stamp.json")
+        backup.writeText(JSONArray().apply { results.forEach { put(testResultToJson(it)) } }.toString(2))
+        val uris = arrayListOf(uriFor(context, csv), uriFor(context, backup))
         val traced = results.filter { it.hasWaveform }
         if (traced.isNotEmpty()) {
             val waveformCsv = File(dir, "chrono_waveforms_$tag$stamp.csv")
@@ -97,7 +101,7 @@ object Exporter {
         }
 
         val send = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-            type = "text/*"
+            type = "*/*"
             putParcelableArrayListExtra(Intent.EXTRA_STREAM, uris)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }

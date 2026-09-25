@@ -146,6 +146,9 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     var editing by remember { mutableStateOf<TestResult?>(null) }
     var waveformReviewResult by remember { mutableStateOf<TestResult?>(null) }
     var manualEntry by remember { mutableStateOf(false) }
+    var confirmArmOverride by remember { mutableStateOf(false) }
+    var recoveryUid by remember { mutableStateOf<String?>(null) }
+    val recoveryMessage by vm.ble.recoveryMessage.collectAsState()
     // (photo uri, owning result uid) so the viewer can offer "set as cover"
     var fullscreenPhoto by remember { mutableStateOf<Pair<android.net.Uri, String>?>(null) }
     var promptPhotoPreview by remember { mutableStateOf<android.net.Uri?>(null) }
@@ -178,8 +181,34 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
     ) {
         item { TopBar(vm, connState, deviceStatus) }
 
+        item {
+            Card {
+                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Shot recovery", style = MaterialTheme.typography.titleMedium)
+                    Text(recoveryMessage, color = TextDim)
+                    if (deviceStatus?.recoveryStorageFailed == true) {
+                        Text("Logger flash backup failed. Keep it powered on until the reading is saved on the phone.", color = Bad)
+                    }
+                    val drafts = vm.availableShotDrafts()
+                    if (drafts.isNotEmpty()) Text("${drafts.size} saved test setups waiting for a reading.", color = TextDim)
+                    vm.results.filter { it.needsShotInfo }.forEach { reading ->
+                        OutlinedButton(onClick = { recoveryUid = reading.uid }, modifier = Modifier.fillMaxWidth()) {
+                            Text("Link shot info: ${reading.splitTimeText()} • ${reading.formattedDate() ?: "time unknown"}")
+                        }
+                    }
+                    TextButton(onClick = { vm.reloadPendingShots() }, enabled = vm.canReloadPendingShots()) {
+                        Text("Check logger again")
+                    }
+                    Text("Unlinked readings stay saved on this phone for later.", style = MaterialTheme.typography.bodySmall, color = TextDim)
+                }
+            }
+        }
+
         if (connState == ConnState.RECONNECTING) {
             item { ReconnectingBanner() }
+        }
+        if ((deviceStatus?.pendingCount ?: 0) >= 16) {
+            item { Text("Logger storage is full. Keep connected to finish saving pending tests before arming again.", color = Amber) }
         }
 
         if (!offline) {
@@ -264,7 +293,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                     enabled = connState == ConnState.CONNECTED && !armed && !running,
                     onCheck = { vm.checkPorts() },
                     onIdentify = { vm.identifyLogger() },
-                    onOverride = { vm.armWithOverride() },
+                    onOverride = { confirmArmOverride = true },
                 )
             }
 
@@ -274,12 +303,34 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 ArmButton(
                     armed = armed,
                     running = running,
-                    connected = (connState == ConnState.CONNECTED || connState == ConnState.RECONNECTING) &&
-                        state != Proto.ST_CHECKING,
+                    connected = connState == ConnState.CONNECTED &&
+                        state != Proto.ST_CHECKING && (deviceStatus?.pendingCount ?: 16) < 16,
                     sensorsReady = vm.sensor1Ready && vm.sensor2Ready,
                     onArm = { vm.arm() },
                     onDisarm = { vm.disarm() },
                 )
+            }
+
+            if (!armed && !running && (!vm.sensor1Ready || !vm.sensor2Ready)) {
+                item {
+                    OutlinedButton(
+                        onClick = { confirmArmOverride = true },
+                        enabled = vm.canRequestArm(),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) { Text("Arm without tap tests", color = Amber) }
+                }
+            }
+
+            item {
+                Text(
+                    "Logger: ${deviceStatus?.pendingCount ?: "?"} pending readings. " +
+                        "Firmware 3.4 keeps the latest completed capture across restarts; older pending shots remain RAM-only.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = TextDim,
+                )
+                TextButton(onClick = { vm.reloadPendingShots() }, enabled = vm.canReloadPendingShots()) {
+                    Text("Reload pending shots")
+                }
             }
 
             if (vm.canAddSetupPhotos && setupPhotos.isNotEmpty()) {
@@ -355,6 +406,51 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                 )
             }
         }
+    }
+
+    if (confirmArmOverride) {
+        AlertDialog(
+            onDismissRequest = { confirmArmOverride = false },
+            title = { Text("Arm without verification?") },
+            text = { Text("Tap tests may be incomplete and port-health warnings will be overridden. " +
+                "The logger may miss the shot or return an invalid reading. Sensors remain unverified; " +
+                "the result will be marked as an override. This arms measurement only.") },
+            confirmButton = {
+                TextButton(
+                    onClick = { confirmArmOverride = false; vm.armWithOverride() },
+                    enabled = vm.canRequestArm(),
+                ) { Text("I understand — arm") }
+            },
+            dismissButton = { TextButton(onClick = { confirmArmOverride = false }) { Text("Cancel") } },
+        )
+    }
+
+    recoveryUid?.let { uid ->
+        val reading = vm.results.firstOrNull { it.uid == uid && it.needsShotInfo }
+        if (reading != null) AlertDialog(
+            onDismissRequest = { recoveryUid = null },
+            title = { Text("Attach reading to shot info") },
+            text = {
+                Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${reading.splitTimeText()} • ${reading.formattedDate() ?: "time unknown"}")
+                    Text("Choose the matching saved setup. The measurement stays unchanged; its speed uses that setup's gate distance.")
+                    vm.availableShotDrafts().filter { it.deviceSerial == reading.deviceSerial }.forEach { draft ->
+                        OutlinedButton(onClick = {
+                            if (vm.linkRecoveredReading(uid, draft.uid)) recoveryUid = null
+                        }, modifier = Modifier.fillMaxWidth()) {
+                            Text("${draft.label} • ${draft.formattedDate() ?: "time unknown"}")
+                        }
+                    }
+                    Text("Or review the Next test details and gate distance, then use them for this reading.", color = TextDim)
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { if (vm.linkRecoveredToCurrentInfo(uid)) recoveryUid = null }) {
+                    Text("Use current details: ${vm.pendingLabel}")
+                }
+            },
+            dismissButton = { TextButton(onClick = { recoveryUid = null }) { Text("Keep for later") } },
+        )
     }
 
     // Sensor-attach flow: fit wire -> RC signature check -> tap test.
@@ -483,7 +579,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                         )
                         Row(verticalAlignment = Alignment.Bottom) {
                             Text(
-                                "%.1f%s".format(s.feetPerSecond, s.reversedMarker),
+                                if (s.hasReportableVelocity) "%.1f%s".format(s.feetPerSecond, s.reversedMarker) else "—",
                                 fontFamily = FontFamily.Monospace,
                                 fontSize = 26.sp,
                                 color = Amber,
@@ -498,7 +594,7 @@ fun DashboardScreen(vm: ChronoViewModel, connState: ConnState, deviceStatus: Dev
                             )
                         }
                         Text(
-                            "%.2f m/s".format(s.metersPerSecond),
+                            s.measurementInvalidReason.ifBlank { if (s.excludedFromReport) "Excluded record" else "Velocity in feet per second" },
                             color = TextDim,
                             style = MaterialTheme.typography.bodyMedium,
                         )
@@ -1031,6 +1127,17 @@ private fun FullLogDialog(
     onFetchWaveform: ((TestResult) -> Unit)?,
 ) {
     val photoRevision = vm.photoRevision
+    val context = LocalContext.current
+    val importFiles = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { vm.importReadings(it) }
+    var query by remember { mutableStateOf("") }
+    var project by remember { mutableStateOf<String?>(null) }
+    var projectMenu by remember { mutableStateOf(false) }
+    val projects = vm.results.map { it.shotFolder.substringBefore('/') }.filter { it.isNotBlank() }.distinct().sorted()
+    val visible = vm.results.filter { result ->
+        (project == null || result.shotFolder.substringBefore('/') == project) &&
+            (query.isBlank() || listOf(result.label, result.tool, result.target, result.specialNotes,
+                result.shotFolder, result.formattedDate().orEmpty()).any { it.contains(query.trim(), ignoreCase = true) })
+    }
     Dialog(
         onDismissRequest = onExit,
         properties = DialogProperties(usePlatformDefaultWidth = false),
@@ -1045,7 +1152,7 @@ private fun FullLogDialog(
                 Column(Modifier.weight(1f)) {
                     Text(title, style = MaterialTheme.typography.headlineMedium, color = Amber)
                     Text(
-                        "${vm.results.size} result${if (vm.results.size == 1) "" else "s"}",
+                        "${visible.count { !it.excludedFromReport }} shots · ${visible.count { it.excludedFromReport }} excluded records",
                         style = MaterialTheme.typography.bodyMedium,
                         color = TextDim,
                     )
@@ -1053,21 +1160,44 @@ private fun FullLogDialog(
                 TextButton(onClick = onExit) { Text("Exit") }
             }
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
+                TextButton(onClick = { importFiles.launch("application/json") }) { Text("Import") }
                 TextButton(onClick = { vm.refreshProjectData() }) { Text("Refresh") }
                 TextButton(onClick = { vm.openDataFolder() }) { Text("Open files") }
             }
+            vm.importMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = TextDim) }
+            OutlinedTextField(
+                value = query, onValueChange = { query = it },
+                label = { Text("Search label, tool, target or notes") },
+                singleLine = true, modifier = Modifier.fillMaxWidth(),
+            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box {
+                    TextButton(onClick = { projectMenu = true }) { Text(project ?: "All projects") }
+                    DropdownMenu(expanded = projectMenu, onDismissRequest = { projectMenu = false }) {
+                        DropdownMenuItem(text = { Text("All projects") }, onClick = { project = null; projectMenu = false })
+                        projects.forEach { name ->
+                            DropdownMenuItem(text = { Text(name) }, onClick = { project = name; projectMenu = false })
+                        }
+                    }
+                }
+                TextButton(enabled = visible.isNotEmpty(), onClick = { Exporter.export(context, visible, vm.isSimulation) }) {
+                    Text("Export shown")
+                }
+            }
+            Text("Saved on this phone ; public copies in ${vm.session.pathLabel}",
+                style = MaterialTheme.typography.bodySmall, color = TextDim)
             Spacer(Modifier.height(6.dp))
             LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (vm.results.isEmpty()) {
+                if (visible.isEmpty()) {
                     item {
                         Text(
-                            "No real test folders with shot.json were found in ChronoData.",
+                            if (vm.results.isEmpty()) "No saved tests yet. Record a test or add a manual entry." else "No matching tests. Clear the search or choose All projects.",
                             color = TextDim,
                             style = MaterialTheme.typography.bodyMedium,
                         )
                     }
                 }
-                items(vm.results, key = { it.uid }) { r ->
+                items(visible, key = { it.uid }) { r ->
                     Column {
                         ResultCard(
                             r = r,
@@ -1815,7 +1945,7 @@ private fun ResultCard(
                 Spacer(Modifier.height(4.dp))
                 Row(verticalAlignment = Alignment.Bottom) {
                     Text(
-                        if (r.metersPerSecond != 0.0) {
+                        if (r.hasReportableVelocity) {
                             "%.1f%s".format(r.feetPerSecond, r.reversedMarker)
                         } else {
                             "—"
@@ -1831,12 +1961,11 @@ private fun ResultCard(
                 val envelopeText = if (accuracyEnvelopePercent >= 0.05)
                     "+/- %.1f%% GAE".format(accuracyEnvelopePercent) else "+/- <0.1% GAE"
                 val detail = when {
-                    r.isManual && r.metersPerSecond != 0.0 ->
-                        "%.2f m/s  ·  manual entry".format(r.metersPerSecond)
-                    r.isManual -> "manual entry"
-                    else -> "%.2f%s m/s  -  %s  -  %s".format(
-                        r.metersPerSecond, r.reversedMarker, r.splitTimeText(), envelopeText
-                    )
+                    r.excludedFromReport -> "Excluded from shot count and report results"
+                    r.measurementInvalidReason.isNotBlank() -> "Invalid chrono reading: ${r.measurementInvalidReason}"
+                    r.isManual -> "Manual entry" + if (r.hasReportableVelocity) "" else " · no chrono velocity"
+                    r.needsShotInfo -> "Awaiting shot details"
+                    else -> "${r.splitTimeText()} · $envelopeText"
                 }
                 Text(
                     detail,
@@ -1877,6 +2006,10 @@ private fun ResultCard(
                         Spacer(Modifier.size(6.dp))
                         Text("Fetch waveform")
                     }
+                }
+                if (r.resultFlags and Proto.RESULT_ARM_OVERRIDE != 0) {
+                    Spacer(Modifier.height(6.dp))
+                    Text("Armed with verification override", style = MaterialTheme.typography.bodyMedium, color = Amber)
                 }
                 r.timingFaultText()?.let { fault ->
                     Spacer(Modifier.height(6.dp))
@@ -2200,7 +2333,7 @@ private fun EditResultDialog(
                         DistanceUnit.valueOf(result.measurementErrorUnit)
                     }.getOrDefault(DistanceUnit.INCHES)
                     val measurementError = result.measurementErrorM / errorUnit.toMeters
-                    val velocityText = if (result.metersPerSecond != 0.0) {
+                    val velocityText = if (result.hasReportableVelocity) {
                         "%.1f%s ft/s".format(result.feetPerSecond, result.reversedMarker)
                     } else {
                         "Not recorded"

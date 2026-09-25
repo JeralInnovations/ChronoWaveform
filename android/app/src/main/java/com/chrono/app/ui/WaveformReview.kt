@@ -402,7 +402,8 @@ private fun MeasurementCard(
     accuracyEnvelopePercent: Double,
 ) {
     val deltaNs = ticksToNanoseconds(stopTick - startTick)
-    val velocityMps = if (deltaNs != 0L && result.distanceM > 0) {
+    val velocityMps = if (deltaNs != 0L && result.distanceM > 0 &&
+        result.measurementInvalidReason.isBlank() && !result.excludedFromReport && !result.needsShotInfo) {
         result.distanceM / (deltaNs / 1_000_000_000.0)
     } else 0.0
     Card(
@@ -425,7 +426,7 @@ private fun MeasurementCard(
             )
             Text(
                 if (velocityMps == 0.0) "Velocity unavailable"
-                else "Velocity  %.2f m/s  ·  %.1f ft/s".format(velocityMps, velocityMps * 3.28084),
+                else "Velocity  %.1f ft/s".format(velocityMps * 3.28084),
                 style = MaterialTheme.typography.titleMedium,
             )
             if (velocityMps != 0.0) {

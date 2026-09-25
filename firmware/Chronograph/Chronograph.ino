@@ -40,6 +40,7 @@
 // These forward declarations keep generated prototypes well-formed.
 struct CalResult;
 struct Pending;
+struct Result;
 
 #include <bluefruit.h>
 #include <nrf_gpio.h>
@@ -168,6 +169,7 @@ const uint8_t UUID_CAL    [16] = CHRONO_UUID(0x0006);
 const uint8_t UUID_INFO   [16] = CHRONO_UUID(0x0007);
 const uint8_t UUID_HEALTH [16] = CHRONO_UUID(0x0008);
 const uint8_t UUID_TRACE  [16] = CHRONO_UUID(0x0009);
+const uint8_t UUID_RECOVERY[16] = CHRONO_UUID(0x000A);
 
 BLEService        svc     (UUID_SERVICE);
 BLECharacteristic chStatus (UUID_STATUS);   // read/notify: StatusPacket below
@@ -177,6 +179,7 @@ BLECharacteristic chTime   (UUID_TIME);     // write: uint32 LE unix seconds
 BLECharacteristic chCal    (UUID_CAL);      // read/notify: CalResult struct below
 BLECharacteristic chInfo   (UUID_INFO);     // read: HwInfo struct below
 BLECharacteristic chHealth (UUID_HEALTH);   // read/notify: HealthPacket below
+BLECharacteristic chRecovery(UUID_RECOVERY); // read: latest completed capture, including acknowledged/previous boot
 BLECharacteristic chTrace  (UUID_TRACE);    // read/notify: chunked TraceEvent stream
 
 // One measurement on the wire. 11 bytes LE — parsed byte-for-byte by the app.
@@ -204,6 +207,9 @@ struct __attribute__((packed)) Result {
 // gets a correct timestamp as long as a sync happens at some point during
 // this boot (it normally does, automatically, on every connect).
 struct Pending {
+  uint32_t captureBootId;
+  uint32_t captureResetCause;
+  uint32_t captureEpoch;
   uint16_t id;
   uint32_t splitNs;
   uint32_t bootMs;
@@ -222,6 +228,11 @@ struct Pending {
 // the BLE link drops while a test is in progress.
 const uint8_t MAX_PENDING = 16;
 Pending  pending[MAX_PENDING];
+#include "RecoveryJournal.h"
+RecoveryJournal<Pending> recoveryJournal;
+Pending latestCapture = {};
+bool latestAvailable = false;
+bool recoveryStorageFailed = false;
 uint8_t  pendingCount = 0;
 uint16_t nextId       = 1;
 
@@ -241,7 +252,7 @@ struct __attribute__((packed)) CalResult {
 // end) reports different numbers here and the app's confidence estimate
 // follows automatically — no app update needed.
 const uint8_t FW_MAJOR = 3;
-const uint8_t FW_MINOR = 2;
+const uint8_t FW_MINOR = 4;
 
 enum : uint16_t {
   PORT_STUCK_HIGH = 1 << 0,
@@ -279,6 +290,9 @@ struct __attribute__((packed)) StatusPacket {
   uint8_t  batteryPercent;
   uint16_t batteryMv;
   uint8_t  legacyBatteryLock; // retained for packet compatibility; always 0
+  uint32_t currentBootId;
+  uint16_t nextResultId;
+  uint8_t recoveryFlags; // bit0 flash save failed, bit1 latest capture available
 };
 
 struct __attribute__((packed)) HwInfo {
@@ -333,7 +347,8 @@ const uint32_t STOP_TIMEOUT_MS = 1000UL;
 
 // ACK ids are queued here from the BLE callback and applied in loop(), so
 // the pending[] buffer is only ever mutated from one context.
-volatile uint16_t ackQueue[MAX_PENDING];
+const uint8_t ACK_QUEUE_SIZE = MAX_PENDING + 1;
+volatile uint16_t ackQueue[ACK_QUEUE_SIZE];
 volatile uint8_t  ackHead = 0, ackTail = 0;
 uint32_t lastBatteryNotifyMs = 0;
 uint16_t filteredBatteryMv = 0;
@@ -763,29 +778,41 @@ void notifyStatus() {
     (uint8_t)(timeValid ? 1 : 0),
     batteryPercentFromMv(batteryMv),
     batteryMv,
-    0  // legacy battery-lock byte; voltage is warning-only in firmware 2.2+
+    0, // legacy battery-lock byte
+    bootId, nextId, (uint8_t)((recoveryStorageFailed ? 1 : 0) | (latestAvailable ? 2 : 0))
   };
   chStatus.write((uint8_t*)&pkt, sizeof(pkt));
   chStatus.notify((uint8_t*)&pkt, sizeof(pkt));
 }
 
-void notifyPending(const Pending& p) {
+Result packetFor(const Pending& p) {
   Result r = {};
   r.id      = p.id;
   r.splitNs = p.splitNs;
-  r.epoch   = epochForBootMs(p.bootMs);   // flywheel: computed fresh each send
+  r.epoch   = p.captureBootId == bootId ? epochForBootMs(p.bootMs) : p.captureEpoch;   // flywheel: computed fresh each send
   r.flags   = p.flags | ((r.epoch != 0) ? RESULT_TIME_VALID : 0);
   r.startTicks = p.startTicks;
   r.stopTicks = p.stopTicks;
   r.batteryMv = p.batteryMv;
   r.portFlags = p.portFlags;
-  r.bootId = bootId;
-  r.resetCause = resetCause;
+  r.bootId = p.captureBootId;
+  r.resetCause = p.captureResetCause;
   r.hwRev = HW_REV;
   r.fwMajor = FW_MAJOR;
   r.fwMinor = FW_MINOR;
   r.formatVersion = 2;
   r.crc16 = crc16Ccitt((const uint8_t*)&r, sizeof(r) - sizeof(r.crc16));
+  return r;
+}
+
+void publishLatest() {
+  if (!latestAvailable) return;
+  Result r = packetFor(latestCapture);
+  chRecovery.write((uint8_t*)&r, sizeof(r));
+}
+
+void notifyPending(const Pending& p) {
+  Result r = packetFor(p);
   chResult.write((uint8_t*)&r, sizeof(r));
   chResult.notify((uint8_t*)&r, sizeof(r));
 }
@@ -848,15 +875,19 @@ void notifyTraceById(uint16_t id) {
       return;
     }
   }
+  if (latestAvailable && latestCapture.id == id) notifyTrace(latestCapture);
 }
 
 void storeResult(uint32_t splitNs, uint8_t flags, uint32_t startTicks, uint32_t stopTicks) {
-  if (pendingCount >= MAX_PENDING) {           // buffer full: drop the oldest
-    memmove(&pending[0], &pending[1], sizeof(pending[0]) * (MAX_PENDING - 1));
-    pendingCount = MAX_PENDING - 1;
-  }
+  // beginArm reserves capacity. Never overwrite an unacknowledged capture.
+  if (pendingCount >= MAX_PENDING) return;
   Pending& p = pending[pendingCount++];
+  memset(&p, 0, sizeof(p));
+  p.captureBootId = bootId;
+  p.captureResetCause = resetCause;
+  p.captureEpoch = epochForBootMs(millis());
   p.id      = nextId++;
+  if (nextId == 0) nextId = 1; // zero is the no-trace-request sentinel
   p.splitNs = splitNs;
   p.bootMs  = millis();                        // flywheel timestamp
   p.flags = flags;
@@ -871,7 +902,12 @@ void storeResult(uint32_t splitNs, uint8_t flags, uint32_t startTicks, uint32_t 
   if (p.traceCount) {
     memcpy(p.trace, activeTrace, p.traceCount * sizeof(TraceEvent));
   }
-  notifyPending(p);  // no-op if nobody is connected/subscribed; FETCH re-sends
+  // Timing has been disarmed before this function. No flash I/O in capture ISR.
+  latestCapture = p;
+  latestAvailable = true;
+  recoveryStorageFailed = !recoveryJournal.save(latestCapture);
+  publishLatest();
+  notifyPending(p);  // ACK frees pending RAM, but leaves the latest backup intact
 }
 
 void finishTimingFault(uint8_t faultFlag) {
@@ -909,6 +945,7 @@ void finishCapturedPair() {
 }
 
 void beginArm(bool overrideFaults) {
+  if (pendingCount >= MAX_PENDING) { setState(ST_FAULT); return; }
   bool healthy = performHealthCheck();
   activeResultFlags = overrideFaults ? RESULT_ARM_OVERRIDE : 0;
   if (!healthy) activeResultFlags |= RESULT_PORT_WARNING;
@@ -993,7 +1030,7 @@ void onControlWrite(uint16_t conn_hdl, BLECharacteristic* chr, uint8_t* data, ui
       break;
     case CMD_ACK: {
       // Defer the buffer edit to loop() — never mutate pending[] here.
-      uint8_t nt = (uint8_t)((ackTail + 1) % MAX_PENDING);
+      uint8_t nt = (uint8_t)((ackTail + 1) % ACK_QUEUE_SIZE);
       if (nt != ackHead) { ackQueue[ackTail] = arg; ackTail = nt; }
       break;
     }
@@ -1059,6 +1096,11 @@ void setup() {
   // starting the SoftDevice; Android negotiates 185 bytes for this protocol.
   Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
   Bluefruit.begin();
+  recoveryStorageFailed = !recoveryJournal.begin(latestCapture, latestAvailable);
+  if (latestAvailable) {
+    nextId = latestCapture.id + 1;
+    if (nextId == 0) nextId = 1;
+  }
   Bluefruit.setTxPower(4);
   char advertisedName[12];
   snprintf(advertisedName, sizeof(advertisedName), "Chrono-%04X",
@@ -1109,7 +1151,7 @@ void setup() {
   // conservative 300 ns per-edge threshold-walk allowance.
   HwInfo info = {
     HW_REV, FW_MAJOR, FW_MINOR, 0, 62500UL, 30, 300,
-    NRF_FICR->DEVICEID[0], NRF_FICR->DEVICEID[1], 2, 1, 0x000F
+    NRF_FICR->DEVICEID[0], NRF_FICR->DEVICEID[1], 2, 1, 0x001F
   };
   chInfo.write((uint8_t*)&info, sizeof(info));
 
@@ -1123,6 +1165,12 @@ void setup() {
   chTrace.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
   chTrace.setMaxLen(180);
   chTrace.begin();
+
+  chRecovery.setProperties(CHR_PROPS_READ);
+  chRecovery.setPermission(SECMODE_OPEN, SECMODE_NO_ACCESS);
+  chRecovery.setFixedLen(sizeof(Result));
+  chRecovery.begin();
+  publishLatest();
 
   notifyStatus();
 
@@ -1185,7 +1233,7 @@ void loop() {
   bool acked = false;
   while (ackHead != ackTail) {
     uint16_t id = ackQueue[ackHead];
-    ackHead = (uint8_t)((ackHead + 1) % MAX_PENDING);
+    ackHead = (uint8_t)((ackHead + 1) % ACK_QUEUE_SIZE);
     ackResult(id);
     acked = true;
   }
